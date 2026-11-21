@@ -1,0 +1,37 @@
+{
+  "enable": true,
+  "dll": "dm.dll",
+  "display": "gdi",
+  "mouse": "windows",
+  "keyboard": "windows",
+  "mode": 0,
+  "reg_code": "yonghufd83601c96660b0709d34423d3bad506",
+  "reg_extra": "tks6514640",
+  "key_delay_ms": 30,
+  "bind_fallbacks": [
+    [
+      "gdi",
+      "windows",
+      "windows",
+      0
+    ],
+    [
+      "normal",
+      "windows",
+      "windows",
+      0
+    ],
+    [
+      "dx2",
+      "windows",
+      "windows",
+      0
+    ],
+    [
+      "dx",
+      "windows",
+      "windows",
+      0
+    ]
+  ]
+}

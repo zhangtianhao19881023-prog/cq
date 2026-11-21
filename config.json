@@ -1,0 +1,70 @@
+{
+  "hp": {
+    "thresh": "55",
+    "unit": "百分比",
+    "key": "F3",
+    "interval": "500",
+    "enable": true
+  },
+  "hide": {
+    "range": "1",
+    "count": "3",
+    "key": "F4",
+    "interval": "1000",
+    "enable": false
+  },
+  "pet": {
+    "key": "F8",
+    "interval": "2000",
+    "enable": false
+  },
+  "pickup": {
+    "range": "6",
+    "fmode": "不捡",
+    "fkeys": "布衣",
+    "enable": true
+  },
+  "monster": {
+    "mode": "不过滤",
+    "keys": "",
+    "npc_block": [],
+    "no_steal": false,
+    "avoid_players": false
+  },
+  "attack": {
+    "enable": true
+  },
+  "bagweight": {
+    "enable": false,
+    "bag_on": true,
+    "bag_thresh": "39",
+    "wt_on": false,
+    "wt_thresh": "98",
+    "action": "stop",
+    "key": "6"
+  },
+  "route": {
+    "points": [
+      [
+        198,
+        149
+      ],
+      [
+        151,
+        98
+      ],
+      [
+        110,
+        51
+      ],
+      [
+        68,
+        105
+      ]
+    ],
+    "enable": true
+  },
+  "routes": {},
+  "proc_name": "ssdzd27vsp.exe",
+  "client": "raqevlhg9a"
+}

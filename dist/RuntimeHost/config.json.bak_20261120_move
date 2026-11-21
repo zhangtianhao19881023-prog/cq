@@ -1,0 +1,118 @@
+{
+  "hp": {
+    "thresh": "55",
+    "unit": "百分比",
+    "key": "F3",
+    "interval": "500",
+    "enable": false
+  },
+  "hide": {
+    "range": "1",
+    "count": "3",
+    "key": "F4",
+    "interval": "1000",
+    "enable": false
+  },
+  "pet": {
+    "key": "F8",
+    "interval": "2000",
+    "enable": false
+  },
+  "pickup": {
+    "range": "6",
+    "fmode": "不捡",
+    "fkeys": "布衣",
+    "enable": false
+  },
+  "monster": {
+    "mode": "不过滤",
+    "keys": "",
+    "npc_block": [
+      "共创计划",
+      "新区介绍",
+      "关注有礼",
+      "点我出去",
+      "角色交易",
+      "宣传有礼",
+      "元宝充值使者"
+    ],
+    "no_steal": false,
+    "avoid_players": false
+  },
+  "attack": {
+    "enable": false
+  },
+  "bagweight": {
+    "enable": false,
+    "bag_on": true,
+    "bag_thresh": "39",
+    "wt_on": false,
+    "wt_thresh": "98",
+    "action": "stop",
+    "key": "6"
+  },
+  "route": {
+    "points": [
+      [
+        237,
+        461
+      ],
+      [
+        151,
+        290
+      ],
+      [
+        71,
+        393
+      ],
+      [
+        135,
+        563
+      ],
+      [
+        237,
+        461
+      ],
+      [
+        151,
+        290
+      ],
+      [
+        71,
+        393
+      ],
+      [
+        135,
+        563
+      ],
+      [
+        237,
+        461
+      ],
+      [
+        215,
+        483
+      ],
+      [
+        217,
+        481
+      ],
+      [
+        218,
+        481
+      ],
+      [
+        217,
+        481
+      ],
+      [
+        237,
+        461
+      ]
+    ],
+    "enable": false
+  },
+  "routes": {},
+  "proc_name": "VR4cHbjNrb.exe",
+  "client": "raqevlhg9a"
+}

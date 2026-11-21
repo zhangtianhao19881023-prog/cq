@@ -1,0 +1,7271 @@
+# -*- coding: utf-8 -*-
+"""
+传奇自动攻击辅助
+- pymem 读取游戏内存
+- 自动攻击按钮：利用游戏内置自动攻击开关
+- 显示怪物数量、名称、坐标、血量
+- 自动查找失败时，可手动选择游戏进程或输入 PID
+"""
+
+import ctypes
+import ctypes.wintypes
+import hashlib
+import io
+import json
+import os
+import queue
+import random
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import tkinter as tk
+from tkinter import ttk, messagebox
+from types import SimpleNamespace
+
+from dm_bridge_script import DM_BRIDGE_PS1
+
+def _say(msg):
+    """打包成无控制台的 exe 后 stdout 是空的, print 会抛异常, 统一包一层"""
+    try:
+        print(msg)
+    except Exception:
+        pass
+
+
+try:
+    import pymem
+    import pymem.process
+except ImportError:
+    _say("缺少 pymem，请先执行：python -m pip install -r requirements.txt")
+    sys.exit(1)
+
+
+def _app_dir():
+    """exe 所在目录 / main.py 所在目录(直接跑源码时)"""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _res_dir():
+    """打包后资源被解到临时目录; 直接跑源码就是脚本目录"""
+    if getattr(sys, "frozen", False):
+        return getattr(sys, "_MEIPASS", _app_dir())
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _data_dir():
+    """放 config.json / log.txt: 优先 exe 旁边; 那里不可写就退到 %APPDATA%"""
+    base = _app_dir()
+    try:
+        t = os.path.join(base, ".wtest")
+        with open(t, "w", encoding="utf-8") as f:
+            f.write("x")
+        os.remove(t)
+        return base
+    except Exception:
+        d = os.path.join(os.environ.get("APPDATA") or base, "天昊助手")
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception:
+            pass
+        return d
+
+
+APP_DIR = _data_dir()
+RES_DIR = _res_dir()
+STEALTH_MODE = (str(os.environ.get("TIANHAO_STEALTH", "")).strip().lower() in ("1", "true", "yes", "on") or os.path.splitext(os.path.basename(sys.executable))[0].lower() == "runtimehost")
+STEALTH_WINDOW_TITLE = str(os.environ.get("TIANHAO_WINDOW_TITLE", "RuntimeHost") or "RuntimeHost")
+
+
+# ==================== 授权(一机一码) ====================
+# 只放**公钥**: 程序能验签, 但签不出来 -> 别人解包也造不出可用授权码
+_LIC_N = 0x64012E0AFAB8103C29D8C1A4EAD9F312A385273BEE67966B2FDC787717AB461ACAD9A78EC0FD7A84C0905AFCE160EE6FA151AD8093B9C969F51399FBD4A7E1906D8B360EE7826A7E462C4D16ABDBB5F66C68FAA464402C2061053E519C1DC60569AAA5EDC50FCF0306B958C434D9735C07D59FC70372F2A2BEC3C835E2D06E83
+_LIC_E = 65537
+LIC_FILE = os.path.join(_app_dir(), "\u6388\u6743.txt")
+
+
+def machine_id():
+    """本机机器码(16 位十六进制)。
+
+    **只用系统 API / 标准库, 不启动外部进程**。
+    之前用 PowerShell 取 CPU/主板/硬盘序列号 -> 打成 exe(--noconsole) 后
+    子进程拿不到标准句柄会失败, 结果退到备用算法,
+    **同一台机器会算出不同的码**(踩过这个坑)。
+    现在用: 注册表 MachineGuid + C 盘卷序列号 + 机器名。
+    必须和 tools\\授权工具.py 里那一份**完全一致**。
+    """
+    parts = []
+    try:
+        import winreg
+        k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                           r"SOFTWARE\Microsoft\Cryptography", 0,
+                           winreg.KEY_READ | getattr(winreg, "KEY_WOW64_64KEY", 0))
+        v = winreg.QueryValueEx(k, "MachineGuid")[0]
+        winreg.CloseKey(k)
+        parts.append(str(v))
+    except Exception:
+        parts.append("")
+    try:
+        vol = ctypes.wintypes.DWORD()
+        ctypes.windll.kernel32.GetVolumeInformationW(
+            "C:\\", None, 0, ctypes.byref(vol), None, None, None, 0)
+        parts.append("%08X" % vol.value)
+    except Exception:
+        parts.append("")
+    try:
+        import socket
+        parts.append(socket.gethostname())
+    except Exception:
+        parts.append("")
+    if not any(parts):
+        parts = ["FALLBACK"]
+    raw = "|".join(parts).upper()
+    return hashlib.sha256(raw.encode("utf-8", "ignore")).hexdigest()[:16].upper()
+
+
+def lic_ok():
+    """\u6821\u9a8c exe \u65c1\u8fb9\u7684 \u6388\u6743.txt\u3002\u8fd4\u56de (\u662f\u5426\u901a\u8fc7, \u5931\u8d25\u539f\u56e0)"""
+    try:
+        if not os.path.exists(LIC_FILE):
+            return False, "\u7f3a\u5c11\u6388\u6743\u6587\u4ef6"
+        txt = io.open(LIC_FILE, encoding="utf-8").read()
+    except Exception as e:
+        return False, "\u8bfb\u4e0d\u4e86\u6388\u6743\u6587\u4ef6: %s" % e
+    code = "".join(ch for ch in txt if ch not in " \t\r\n")
+    if not code:
+        return False, "\u6388\u6743\u6587\u4ef6\u662f\u7a7a\u7684"
+    try:
+        sig = int(code, 16)
+    except Exception:
+        return False, "\u6388\u6743\u7801\u683c\u5f0f\u4e0d\u5bf9"
+    try:
+        k = (_LIC_N.bit_length() + 7) // 8
+        em = pow(sig, _LIC_E, _LIC_N).to_bytes(k, "big")
+        if em[0] != 0 or em[1] != 1:
+            return False, "\u6388\u6743\u7801\u65e0\u6548"
+        i = em.find(b"\x00", 2)
+        if i < 10 or any(b != 0xFF for b in em[2:i]):
+            return False, "\u6388\u6743\u7801\u65e0\u6548"
+        want = hashlib.sha256(machine_id().encode("utf-8")).digest()
+        if em[i + 1:] != want:
+            return False, "\u6388\u6743\u7801\u4e0d\u662f\u8fd9\u53f0\u673a\u5668\u7684"
+        return True, ""
+    except Exception as e:
+        return False, "\u6821\u9a8c\u51fa\u9519: %s" % e
+
+
+def lic_ensure():
+    """\u542f\u52a8\u65f6\u8c03\u7528: \u6ca1\u6388\u6743\u5c31\u5f39\u7a97\u663e\u793a\u673a\u5668\u7801\u5e76\u9000\u51fa"""
+    ok, why = lic_ok()
+    if ok:
+        return True
+    mid = machine_id()
+    # 把机器码写成文件, 方便对方直接把这个文件发给作者(exe 旁边写不了就退到数据目录)
+    saved = ""
+    for d in (_app_dir(), _data_dir()):
+        try:
+            fp = os.path.join(d, "机器码.txt")
+            io.open(fp, "w", encoding="utf-8").write(
+                "天昊助手 机器码\n\n机器码：%s\n\n"
+                "把这个文件发给作者，拿到 授权.txt 后放到\n"
+                "天昊助手.exe 同一个文件夹里，再重新打开。\n" % mid)
+            saved = fp
+            break
+        except Exception:
+            continue
+    msg = ("天昊助手 未授权\n\n"
+           "本机机器码：\n%s\n\n"
+           "原因：%s\n\n"
+           "%s"
+           "流程：把机器码发给作者 -> 拿到【授权.txt】->\n"
+           "放到 天昊助手.exe 同一个文件夹里 -> 重新打开\n\n"
+           "(这个弹窗按 Ctrl+C 可以复制全部文字)") % (
+               mid, why,
+               ("机器码已存成文件：\n%s\n\n" % saved) if saved else "")
+    try:
+        ctypes.windll.user32.MessageBoxW(None, msg, "\u5929\u660a\u52a9\u624b - \u672a\u6388\u6743", 0x10)
+    except Exception:
+        try:
+            print(msg)
+        except Exception:
+            pass
+    return False
+
+
+# ==================== 配置 ====================
+PROCESS_NAME = "icqs5rhqqp.exe"
+MODULE_NAME = "icqs5rhqqp.exe"
+# 期望的主模块内存大小(SizeOfImage). 0=不校验; 同名不同版本的 exe 靠它区分
+MODULE_SIZE = 0
+
+# 配置保存文件（点击“保存”后，下次启动自动读取）
+CONFIG_FILE = os.path.join(APP_DIR, "config.json")
+# 打包进 exe 的默认设置(黑名单/白名单/过滤/路点等): 边上没有 config.json 时用它
+CONFIG_DEFAULT = os.path.join(RES_DIR, "config.json")
+# 进程名覆盖: 客户端 exe 名和 profile 不一样时(微端随机名/别服客户端)用它自己的名字绑定
+# 空 = 用 profile 的 PROCESS_NAME; 非空会记进 config.json 的 proc_name
+PROC_NAME_OVERRIDE = ""
+
+# ---- 多客户端配置 ----
+# 跟具体客户端绑定的量全部放 clients.json; 下面两个元组是"允许被覆盖的键"名单。
+CLIENTS_FILE = os.path.join(APP_DIR, "clients.json")
+CLIENTS_DEFAULT = os.path.join(RES_DIR, "clients.json")   # 打包进 exe 的默认配置
+CLIENT_MODULE_KEYS = (
+    "PROCESS_NAME", "MODULE_NAME", "MODULE_SIZE",
+    "OFF_PLAY_SCENE", "OFF_PLAYER", "OFF_TARGET_CRET", "AUTO_ATTACK_SLOT",
+    "OFF_AUTO_ATTACK_OBJ", "OFF_AUTO_ATTACK_SLOT",
+    "OFF_AUTO_ATTACK_OBJ_ALT", "OFF_AUTO_ATTACK_SLOT_ALT",
+    "OFF_MOVE_OBJ_PTR", "OFF_MOVE_FUNC", "MOVE_OBJ_X", "MOVE_OBJ_Y",
+    "START_MOVE_FUNC", "MOVE_SUB_STATE_OFF", "MOVE_STATE_OBJ_OFF",
+    "MOVE_ACTIVE_FLAG_OFF", "MOVE_PLAYER_SUB_OFF", "MOVE_PLAYER_STATE_OFF",
+    "MOVE_CLEAR_78_OFF", "MOVE_CLEAR_E4_OFF",
+    "MOVE_STOP_GLOBAL_A_OFF", "MOVE_STOP_GLOBAL_B_OFF",
+    "OFF_BAG_SLOT1", "BAG_SLOT_SIZE", "BAG_SLOT_COUNT",
+    "OFF_ACTOR_LIST", "OFF_ACTOR_COUNT", "OFF_ACTOR_ARRAY",
+    "OFF_NAME", "OFF_CATEGORY", "OFF_X", "OFF_Y",
+    "MONSTER_HP", "MONSTER_MAX_HP", "MONSTER_DEAD_OFF", "MONSTER_MAX_DIST",
+    "NPC_KEYWORDS", "MONSTER_VMTS", "PET_VMTS", "TRAP_MARK1", "TRAP_MARK2", "TRAP_MARKS",
+    "TRAP_VMTS",
+    "ACTOR_DYNAMIC",
+    "COUNT_ALIVE_ONLY",
+    "OFF_ATTACK_SLOT_PTR", "OFF_ATTACK_SLOT_PTR2",
+    "ATTACK_SLOT_DELTA", "ATTACK_SLOT_DELTA2",
+)
+CLIENT_CLASS_KEYS = (
+    "PLAYER_HP_OFF", "PLAYER_MAXHP_OFF",
+    "PLAYER_STATUS_OFF", "PLAYER_HIDDEN_BIT",
+    "WEIGHT_OFF", "WEIGHT_MAX_OFF",
+    "OFF_GUAJI", "ITEM_SLOT0", "ITEM_SLOT_OFF", "OFF_ITEM_REC",
+)
+ACTIVE_CLIENT = ""        # 当前生效的配置 id(由 main 选定)
+# json 里只能写数组, 但代码里这几个键是 set / tuple, 应用时要转回原类型
+CLIENT_SET_KEYS = ("MONSTER_VMTS", "TRAP_VMTS", "PET_VMTS")
+_CLIENT_DEFAULTS = {}      # 内置默认值快照(换客户端时先还原, 见 apply_client_profile)
+CLIENT_TUPLE_KEYS = ("NPC_KEYWORDS",)
+
+# 主模块偏移
+OFF_PLAY_SCENE = 0x2DF80C       # PlayScene 全局指针
+OFF_PLAYER = 0x2FA918           # g_MySelf 玩家对象指针
+# True = 该客户端没有静态场景指针, Actor 指针数组只能运行时反查(见 _find_actor_array)
+# 由 clients.json 的 profile 覆盖; 默认 False = 用老的 [scene+OFF_ACTOR_LIST] 链
+ACTOR_DYNAMIC = False
+# True = 怪物数量标签只算活怪(尸体不计). 老客户端保持原样(False)
+COUNT_ALIVE_ONLY = False
+OFF_TARGET_CRET = 0x2DFBDA      # g_TargetCret 攻击目标(记录用)
+AUTO_ATTACK_SLOT = 0x0A65ABC4   # 旧硬编码地址(堆内动态地址，仅作兜底)
+# ---- 自动打怪槽 静态基址链(已实测验证) ----
+# 0x0A65ABC4 是运行时堆地址(临时地址)，每次重启都会变，必须用指针链定位
+# 主链: [icqs5rhqqp.exe+0x28A470] + 0x3B4
+OFF_AUTO_ATTACK_OBJ = 0x28A470       # 模块内全局指针 -> 自动攻击所属对象
+OFF_AUTO_ATTACK_SLOT = 0x3B4         # 对象内偏移 -> 自动打怪槽
+# 备链: [icqs5rhqqp.exe+0x2B87B4] + 0x1B4 (同一结构的子对象)
+OFF_AUTO_ATTACK_OBJ_ALT = 0x2B87B4
+OFF_AUTO_ATTACK_SLOT_ALT = 0x1B4
+
+# ---- 自动寻路 ----
+OFF_MOVE_OBJ_PTR = 0x2BA8FC
+OFF_MOVE_FUNC = 0x1D32AC
+MOVE_OBJ_X = 0xD4
+MOVE_OBJ_Y = 0xD8
+START_MOVE_FUNC = 0
+MOVE_SUB_STATE_OFF = 0x5C
+MOVE_STATE_OBJ_OFF = 0x60
+MOVE_ACTIVE_FLAG_OFF = 0x40
+MOVE_PLAYER_SUB_OFF = 0x5C
+MOVE_PLAYER_STATE_OFF = 0x60
+MOVE_CLEAR_78_OFF = 0x78
+MOVE_CLEAR_E4_OFF = 0xE4
+MOVE_STOP_GLOBAL_A_OFF = 0x275D7C
+MOVE_STOP_GLOBAL_B_OFF = 0x274EFC
+MOVE_TIMER_INTERVAL_MS = 100
+MOVE_STOP_ZERO_CYCLES = 3
+MOVE_STOP_MAX_CYCLES = 40
+MOVE_CMD_IDLE = 0
+MOVE_CMD_MOVE = 1
+MOVE_CMD_STOP = 2
+MOVE_CMD_MIN_INTERVAL_SEC = 0.35
+ROUTE_RETRY_SEC = 2.5           # 寻路: 人物停下但没到达 -> 多久后重发指令
+ROUTE_NO_MOVE_SEC = 3.0         # 寻路: 下发点位后人物一步没动, 超过这么久 -> 无效坐标直接删除
+ROUTE_STUCK_SEC = 5.0           # 寻路: 动过但距离不再接近(卡住/徘徊)超过这么久 -> 跳过执行下一个点
+ROUTE_STOP_BEFORE_ATTACK_SEC = 0.8  # 发现怪物后先停车，等移动停止再交给自动攻击
+START_MIN_WIDTH = 520           # 启动时窗口最小宽度(比内容需求宽一点, 看着不挤)
+PET_KEY = "F8"                  # pet summon key (fixed, removed from UI)
+PET_INTERVAL_MS = 2000
+# 宠物只有一个判断: 有没有活着的宝宝(自己的召唤兽)。
+#   有活体 -> 绝不按召唤键; 没有活体(尸体 / 一只都没有 / 重进游戏 / 换角色 / 换地图) -> 按召唤键。
+# 近处靠 ActorList, 远处靠 get_pet() 直读上次那个宝宝对象(对象一直在内存里, 地址不变)。
+PET_START_DELAY_SEC = 5.0       # 点开始挂机后, 先等几秒(留给用户切回游戏窗口)再检测/召唤
+GUAJI_START_DELAY_SEC = 2.0     # 点"开始挂机"后, 整体延迟几秒才真正开始(扫描+各功能)
+PICK_WAIT_SEC = 2.0             # 自动捡物: 站到物品格后, 多久还不消失 -> 认为捡不起来
+PICK_FAIL_COOLDOWN = 20.0       # 自动捡物: 捡不起来的物品, 多久后允许再试一次
+PICK_REACH_SEC = 8.0            # 自动捡物: 去某件物品走了这么久还没靠近 -> 认为到不了
+LOOT_PAUSE_SEC = 8.0            # 打死怪后最多暂停打怪多久, 留时间给自动捡物(捡完提前结束)
+LOOT_APPEAR_SEC = 4.0           # 掉落物是客户端延迟生成的: 最多等这么久(硬上限, 慢机器也不许超过)
+LOOT_APPEAR_SCANS = 3           # 但要"真的看了地上 N 次都空"才算没得捡(按次数, 不按秒)
+# 节奏诊断日志: 打完怪 -> 开始/结束捡物 -> 开始打下一只, 每步都写 log.txt 并带上间隔秒数
+RHYTHM_TRACE = True
+# 性能: 一次扫描(get_actors/get_items)超过这么多毫秒就写日志 + 把"等掉落"的时间窗按机器速度放大。
+# 老机器内存读得慢, 一拍可能就好几秒, 固定秒数的时间窗会被吃光 -> 表现成"随机漏捡/乱换目标"。
+SELFSCAN_LOG_MS = 1200
+ACTOR_CACHE_SEC = 0.3
+ITEM_CACHE_SEC = 0.5
+PLAYER_POS_CACHE_SEC = 0.1
+PLAYER_HP_CACHE_SEC = 0.1
+BAG_CACHE_SEC = 1.0
+MOVE_CLAIM_HOLD_SEC = 2.5       # 移动权: 一次下发移动指令后独占多久(秒), 期间低优先级线程不许再发
+MOVE_PRIO_ROUTE = 1
+MOVE_PRIO_PICK = 2
+MOVE_PRIO_ATTACK = 3
+MOVE_STATE_IDLE = "IDLE"
+MOVE_STATE_PATROL = "PATROL"
+MOVE_STATE_PICKUP = "PICKUP"
+MOVE_STATE_ATTACK = "ATTACK"
+
+# ---- 状态日志（判断掉线原因用）----
+LOG_FILE = os.path.join(APP_DIR, "log.txt")
+LOG_MAX_BYTES = 2 * 1024 * 1024
+_LOG_STARTED = False      # 本次运行是否已经写过第一条日志(第一条会清空旧日志)
+
+
+def app_log(text):
+    """写日志(带时间戳)。每次启动辅助的第一条日志会清空上次的 log, 只保留当前这次运行。"""
+    global _LOG_STARTED
+    try:
+        if not _LOG_STARTED:
+            _LOG_STARTED = True
+            try:
+                os.remove(LOG_FILE)      # 清掉上次运行的日志
+            except Exception:
+                pass
+        elif os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > LOG_MAX_BYTES:
+            try:
+                os.remove(LOG_FILE + ".1")
+            except Exception:
+                pass
+            try:
+                os.rename(LOG_FILE, LOG_FILE + ".1")
+            except Exception:
+                pass
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write("%s  %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), text))
+    except Exception:
+        pass
+# ---- 背包 (固定数组, 实测: exe+0x2E1674 起, 每格 0x9C, 共40格) ----
+OFF_BAG_SLOT1 = 0x2E1674        # 背包第1格的模块偏移
+BAG_SLOT_SIZE = 0x9C            # 每格 156 字节
+BAG_SLOT_COUNT = 40             # 背包格数
+BAG_CATEGORY_ID_OFF = 0x15      # 背包格内: 物品类别ID(byte)
+
+# ActorList / Actor
+OFF_ACTOR_LIST = 0x34
+OFF_ACTOR_COUNT = 0x04
+OFF_ACTOR_ARRAY = 0x08
+
+# Actor 字段偏移
+OFF_NAME = 0x0C                 # AnsiString 名称指针
+OFF_CATEGORY = 0x04             # 角色类别: 1=玩家 4=召唤兽/宝宝 0=其他(怪物/NPC)
+OFF_X = 0x68                    # X 坐标
+OFF_Y = 0x6C                    # Y 坐标
+
+# 玩家（THumActor3）血量
+
+# 怪物（TCatMon 等）血量（已实测验证）
+MONSTER_MAX_HP = 0x11A          # 怪物最大血量 (实测: +11A 是最大血 36/15/23)
+MONSTER_HP = 0x112              # 怪物当前血量 (0 = 已死亡/尸体)
+MONSTER_DEAD_OFF = 0            # 怪物死亡标志偏移: 0=不启用; profile 可覆盖为 0xAC
+# 怪物最大有效距离(曼哈顿: |dx|+|dy|, 和列表里"距离"列同一个算法)。
+# 客户端会把已经走远的怪继续留在 ActorList 里(残影), 这种超出攻击距离,
+# 选它只会白白触发卡位判定并拉黑, 所以在源头就过滤掉。
+MONSTER_MAX_DIST = 16
+
+# 防挂机陷阱怪签名(本客户端实测): 对象 +0xC8(WORD) = TRAP_MARK1 且 +0xCC(WORD) = TRAP_MARK2
+# 实测: 创世纪传奇的陷阱怪(名字会伪装成"稻草人"/"鹿") = 162 / 2048
+#       真怪 / 玩家 / 守卫(NPC) 全是 255 / 65535
+# 两个都设 0 = 关闭该过滤
+TRAP_MARK1 = 0
+TRAP_MARK2 = 0
+# 多条签名(不同怪物类各有自己的陷阱版): [[+0xC8值, +0xCC值], ...], 空 = 不加这条
+# 实测: 鹿/稻草人 那族是 [162, 2048]; 别的类(比如僵尸)签名不一样 -> 实测后往这里加
+TRAP_MARKS = []
+# 陷阱"壳类": 这些 VMT 的对象一律不显示/不打(不看签名).
+# 实测创世纪传奇: 0x005C0D80 = TArcherMon —— 鹿/稻草人陷阱、僵尸陷阱、弓箭守卫 全是这个类;
+# 普通怪(TZombiZilkin 僵尸 / TGasKuDeGi 洞蛆 / TCatMon 稻草人 ...)都不是 -> 按类名一刀切.
+# 该类的父链: TActor -> 0x005C0B00(怪物根类) -> TCatMon -> TArcherMon
+# 由 clients.json 的 profile 键 TRAP_VMTS 覆盖(可写 ["0x005C0D80"]); 空集合 = 不启用
+TRAP_VMTS = set()
+# 陷阱怪一律用"已知签名"(TRAP_MARK1/TRAP_MARK2 + TRAP_MARKS)和"陷阱壳类"(TRAP_VMTS)精确挡。
+# 不再用"只留 255/65535"的白名单式判定 —— 那会把打死后复活的怪、以及未知的正常怪一起挡掉;
+# 复活怪由 AUTO_ATTACK_DEAD_FORGET_SEC 的限时释放处理。
+
+# 自动攻击 CheckBox
+
+# 怪物类 VMT 集合（当前客户端版本）
+# NPC 名称关键词（过滤守卫、商人等非战斗目标）
+PET_VMTS = set()          # 宠物对象的 VMT(客户端 profile 覆盖). 示例: {"0x005C1084"}
+NPC_KEYWORDS = (
+    "守卫", "卫士", "商人", "屠夫", "铁匠", "药店", "仓库",
+    "管理员", "雕像", "传送", "公告牌", "镖局", "武馆",
+)
+MONSTER_VMTS = {
+    0x005B74E8,  # TMineMon
+    0x005B7618,  # TCentipedeKingMon
+    0x005B76C8,  # TBigHeartMon
+    0x005B7764,  # TSpiderHouseMon
+    0x005C0CEC,  # TCatMon / 当前大野猪
+    0x005C0D80,  # TArcherMon
+    0x005C0E18,  # TScorpionMon
+    0x005C162C,  # TSculptureKingMon
+    0x005C16CC,  # TSmallElfMonster
+    0x005C176C,  # TWarriorElfMonster
+    0x005C180C,  # TElectronicScolpionMon
+    0x005C1948,  # TKingOfSculpureKingMon
+    0x005C19EC,  # TSkeletonKingMon
+    0x005C1B24,  # TSkeletonSoldierMon
+    0x005C1BC4,  # TSkeletonArcherMon
+    0x005C1C78,  # TBanyaGuardMon
+    0x005C1D28,  # TStoneMonster
+    0x005C1DD4,  # TPBOMA1Mon
+    0x005C1E6C,  # TPBOMA6Mon
+    0x005C205C,  # TKhazardMon
+    0x005C2494,  # TSnowMon
+}
+# 地图格子像素尺寸（如果点击位置不准，调整这两个值）
+
+# 自动攻击: 人物坐标超过这么多秒没变化、且离目标还很远 -> 判定卡位，换下一个怪
+AUTO_ATTACK_STUCK_SEC = 5.0
+AUTO_ATTACK_NEAR = 2          # 此距离(切比雪夫)内视为已靠近，不判卡位
+AUTO_ATTACK_NOHP_SEC = 30.0
+AUTO_ATTACK_MAX_SEC = 0.0     # >0: 同一个目标打这么久(秒)还没死 -> 放弃换目标(0=关闭)
+AUTO_ATTACK_DMG_GRACE = 8.0   # 最近这么多秒内打到过目标(掉过血) -> 不判卡位
+AUTO_ATTACK_STAND_SEC = 3.0   # 人物"原地不动"(被障碍物挡住)这么多秒 -> 直接判卡位(快)
+# 死亡名单保留时间(秒): 僵尸被打死后会**原地复活**(同一个对象重新变活怪),
+# 旧的 set 名单是"只要对象还在 ActorList 就永久拉黑" -> 复活的怪永远不显示也不打。
+# 超时就把它从名单里放出来; 0 = 不启用(永久拉黑)
+AUTO_ATTACK_DEAD_FORGET_SEC = 15.0
+AUTO_ATTACK_BLACK_SEC = 90.0  # 卡位黑名单保留时间: 怪走出视野也不立刻解禁(否则会来回徘徊)
+# 卡位黑名单里的怪"自己走过来"贴到这么近 -> 无视黑名单立刻放出来打
+# (它都贴脸打你了还站着挨打不合理; 0 = 关闭这条豁免)
+AUTO_ATTACK_CLOSE_FORCE = 1
+AUTO_ATTACK_SWITCH_LOCK = 3.0 # 换过目标后这么多秒内不再因"卡位/不掉血"换(行为更像人)
+# 别人在打的怪: 我们不碰它、它的血却自己掉了 -> 判定"有人在打", 这么多秒内不选它当目标
+# (客户端对画面内的怪会持续同步血量, 所以"血自己掉"能看出来; 0 = 关闭这个功能)
+AUTO_ATTACK_OTHERS_SEC = 30.0
+# 【有人就闪】总开关: 屏幕里出现别的玩家 -> 放弃打怪, 去寻路, 等屏幕里没别人了再打
+# (界面底部功能条【攻击】后面的勾选框 / config.json 的 monster.avoid_players 控制)
+AVOID_PLAYERS = True
+# 屏幕上"别的玩家"的判定距离(切比雪夫格数). 客户端屏幕大约 ±16 格
+AVOID_PLAYER_DIST = 16
+# 人走了之后再多等这么多秒才恢复打怪(避免在边界上反复横跳)
+AVOID_PLAYER_CLEAR_SEC = 3.0
+# 【不抢怪】总开关: 界面底部功能条【攻击】后面的勾选框(攻击的第2项, 单独勾不起作用) / config.json 的 monster.no_steal
+NO_STEAL = True
+def pid_window_title(pid):
+    """返回该进程主窗口标题(取第一个可见的)，取不到返回空串"""
+    user32 = ctypes.windll.user32
+    result = {"title": ""}
+
+    def cb(hwnd, _lp):
+        try:
+            p = ctypes.wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(p))
+            if p.value == pid and user32.IsWindowVisible(hwnd):
+                n = user32.GetWindowTextLengthW(hwnd)
+                if n > 0:
+                    buf = ctypes.create_unicode_buffer(n + 1)
+                    user32.GetWindowTextW(hwnd, buf, n + 1)
+                    t = buf.value.strip()
+                    if t:
+                        result["title"] = t
+                        return False
+        except Exception:
+            pass
+        return True
+
+    try:
+        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND,
+                                         ctypes.wintypes.LPARAM)
+        user32.EnumWindows(WNDENUMPROC(cb), 0)
+    except Exception:
+        pass
+    return result["title"]
+# ==================== CE-FastFind: 动态 Actor / 怪物列表 ====================
+# 用于"没有静态场景指针"的客户端(如 pib12goxp4)。2026-10-07 实测验证。
+#   Actor: +0x00 VMT(须在模块区间) +0x04 类别(1=玩家 0=怪/NPC 4=召唤兽)
+#          +0x0C 名字指针(AnsiString: 长度在 np-4, 文本在 np, GBK)
+#          +0x64 X +0x68 Y            ← 新客户端坐标偏移(旧客户端是 0x68/0x6C)
+#   Actor 指针数组: 无静态锚点 → 用"谁存了玩家对象指针"反查, 再左右展开
+#   注意: 数组是固定容量池(实测 260 槽), 大部分是已释放的失效槽(名字长度=0), 必须按名字非空过滤
+def _tp_i32(pm, a):
+    try:
+        return pm.read_int(a)
+    except Exception:
+        return None
+def _tp_actor_ok(pm, p, base, modsize):
+    """p 是不是合法 Actor 对象(数组展开时的边界判定)"""
+    if not p or p < 0x10000 or p >= 0x80000000:
+        return False
+    vmt = _tp_i32(pm, p)
+    if not vmt or not (base <= vmt < base + modsize):
+        return False
+    try:
+        cat = pm.read_uchar(p + OFF_CATEGORY)
+    except Exception:
+        return False
+    if cat not in (0, 1, 4):
+        return False
+    x, y = _tp_i32(pm, p + OFF_X), _tp_i32(pm, p + OFF_Y)
+    if not x or not y or not (0 < x <= 10000 and 0 < y <= 10000):
+        return False
+    return True
+_MEM_COMMIT = 0x1000
+_PAGE_GUARD = 0x100
+_READABLE_PROT = (0x02, 0x04, 0x08, 0x20, 0x40, 0x80)   # R / RW / WRITECOPY / ER / ERW / EWC
+_ACTOR_ARRAY_CACHE = {"pid": None, "player": 0, "addr": 0, "idx": 0, "count": 0}
+# 自动攻击目标槽: 往里写"怪物对象地址"就自动攻击, 写 0 停止
+# 两条独立静态链, 正常情况应指向同一个槽(用来互相校验)
+OFF_ATTACK_SLOT_PTR = 0x0        # [exe+..] -> 世界对象
+ATTACK_SLOT_DELTA = 0x0          # 世界对象 + delta = 目标槽
+OFF_ATTACK_SLOT_PTR2 = 0x0       # 备用链
+ATTACK_SLOT_DELTA2 = 0x0
+def ff_iter_regions(pm, lo, hi):
+    """枚举 [lo,hi) 里"已提交且可读"的区域, 返回 [(base, stop), ...]
+
+    固定长度分块 read_bytes 在"跨未映射页的大块"上会整块失败, 从而漏掉命中(实测踩过),
+    所以先用 VirtualQueryEx 拿到可读区域, 只在区域内部读。
+    """
+    out = []
+    a = lo
+    while a < hi:
+        try:
+            mbi = pymem.memory.virtual_query(pm.process_handle, a)
+            base, size = int(mbi.BaseAddress), int(mbi.RegionSize)
+            state, prot = int(mbi.State), int(mbi.Protect)
+        except Exception:
+            break
+        if size <= 0:
+            break
+        stop = base + size
+        if state == _MEM_COMMIT and (prot & 0xFF) in _READABLE_PROT and not (prot & _PAGE_GUARD):
+            out.append((max(base, lo), min(stop, hi)))
+        a = stop if stop > a else a + 0x1000
+    return out
+def ff_find_pointers(pm, value, base, modsize, lo=0x00010000, hi=0x7FFF0000,
+                     chunk=0x100000, limit=32):
+    """堆里所有存放了 value 的位置(模块外的), 最多 limit 个"""
+    hits = []
+    if not value:
+        return hits
+    pat = struct.pack("<I", value)
+    for rbase, rstop in ff_iter_regions(pm, lo, hi):
+        a = rbase
+        carry = b""
+        while a < rstop and len(hits) < limit:
+            n = min(chunk, rstop - a)
+            if n <= 0:
+                break
+            try:
+                buf = pm.read_bytes(a, n)
+                blk = carry + buf
+                blk_at = a - len(carry)
+                carry = buf[-3:]
+            except Exception:
+                blk, blk_at, carry = carry, a - len(carry), b""
+            i = blk.find(pat)
+            while i >= 0:
+                va = blk_at + i
+                if not (base <= va < base + modsize) and va not in hits:
+                    hits.append(va)
+                i = blk.find(pat, i + 1)
+            a += n
+    return hits
+def ff_region_of(pm, addr):
+    """addr 所在的"已提交且可读"区域 (base, stop); 取不到返回 None"""
+    try:
+        mbi = pymem.memory.virtual_query(pm.process_handle, int(addr))
+        base, size = int(mbi.BaseAddress), int(mbi.RegionSize)
+        state, prot = int(mbi.State), int(mbi.Protect)
+        if (size > 0 and state == _MEM_COMMIT
+                and (prot & 0xFF) in _READABLE_PROT and not (prot & _PAGE_GUARD)):
+            return base, base + size
+    except Exception:
+        pass
+    return None
+def ff_find_pointers_near(pm, value, center, radius, base, modsize, limit=32):
+    """只在 center±radius 范围内找存放 value 的位置(数组重分配一般就在附近, 比全堆快得多)"""
+    try:
+        center = int(center)
+    except Exception:
+        return []
+    lo = max(0x00010000, center - int(radius))
+    hi = min(0x7FFF0000, center + int(radius))
+    if hi <= lo:
+        return []
+    return ff_find_pointers(pm, value, base, modsize, lo=lo, hi=hi,
+                            chunk=0x100000, limit=limit)
+def _ff_expand_actors(pm, player, hits, base, modsize):
+    """挑出最长的一段连续 Actor 指针数组
+
+    返回 (count, start, player_idx): player_idx = 玩家在数组里的下标(0 起)
+    (玩家一般**不在第 0 格**, 所以缓存校验必须用 player_idx, 不能假定是首格)
+    """
+    best = None
+    for hit in hits:
+        try:
+            if _tp_i32(pm, hit) != player:
+                continue
+        except Exception:
+            continue
+        s = e = hit
+        while _tp_actor_ok(pm, _tp_i32(pm, s - 4), base, modsize):
+            s -= 4
+        while _tp_actor_ok(pm, _tp_i32(pm, e + 4), base, modsize):
+            e += 4
+        count = (e - s) // 4 + 1
+        if _tp_actor_ok(pm, player, base, modsize) and (best is None or count > best[0]):
+            best = (count, s, (hit - s) // 4)
+    return best
+_ACTOR_ARRAY_LOCK = threading.Lock()      # 刷新线程 + 打怪线程会同时反查, 不加锁会各扫一遍全堆
+def ff_find_actor_array(pm, base, modsize, player=None):
+    """反查 Actor 指针数组 -> (count, array_addr); 失败 None
+
+    **必须加锁**: 界面刷新(主线程) 和 打怪循环(工作线程) 会同时调用,
+    不加锁时两边都发现"缓存没命中"-> **各扫一遍全堆** (实测日志里连着两条
+    "[Actor] 全堆重查 1.1s / 1.3s -> 同一个数组", 就是这个问题)。
+    加锁后第二个调用会等第一个扫完, 然后直接命中缓存。
+    """
+    with _ACTOR_ARRAY_LOCK:
+        return _ff_find_actor_array(pm, base, modsize, player)
+def _ff_find_actor_array(pm, base, modsize, player=None):
+    """(内部实现, 调用方请用 ff_find_actor_array)
+
+    返回 **二元组 (count, array_addr)**; 失败 None。
+
+    注意: 内部 _ff_expand_actors 是 3 元组(count, start, player_idx),
+    对外**必须**只返回前两个 —— 曾经漏了, 导致 get_actors() 解包报错 -> 界面"怪 0"。
+
+    四级查找(从便宜到贵):
+      1) 缓存: 数组没搬家(玩家那一格还指着玩家) -> 直接用(最快, 几十微秒);
+      2) 上次数组所在的整个可读堆区(<=32MB)里找;
+      3) 上次数组地址 ±8MB 内找;
+      4) 全堆兜底(慢, 约 2 秒, 尽量不要走到)。
+    """
+    if player is None:
+        player = _tp_i32(pm, base + OFF_PLAYER)
+    if not player:
+        return None
+    pid = getattr(pm, "process_id", None)
+    c = _ACTOR_ARRAY_CACHE
+
+    def _pick(hits):
+        """展开候选地址; 若只展开到"仅玩家 1 格"而之前有更多 -> 当成没找到(多半撞到旧副本)
+
+        怪多的时候堆里可能留着数组的旧副本, 只含 1 个槽;
+        误用它会得到 "count=1" -> 界面/打怪都以为附近没怪。
+        """
+        got = _ff_expand_actors(pm, player, hits, base, modsize)
+        if (got and got[0] <= 1 and c["player"] == player
+                and c["count"] > 1 and got[1] != c["addr"]):
+            return None
+        return got
+
+    if (c["addr"] and c["player"] == player and c["pid"] == pid
+            and _tp_i32(pm, c["addr"] + c.get("idx", 0) * 4) == player):
+        # 玩家那一格还指着玩家 -> 数组没搬家; 顺便往后探一探数组有没有变长
+        _s = c["addr"]
+        _e = _s + max(1, c["count"]) * 4
+        for _ in range(64):
+            if _tp_actor_ok(pm, _tp_i32(pm, _e), base, modsize):
+                _e += 4
+            else:
+                break
+        _n = max(c["count"], (_e - _s) // 4)
+        c["count"] = _n
+        return _n, _s
+    if c["player"] == player and c["addr"]:
+        # 2a) 先扫"上次数组所在的整个可读区域"(数组重分配通常还在同一个堆区)
+        reg = ff_region_of(pm, c["addr"])
+        if reg and (reg[1] - reg[0]) <= 0x2000000:      # 区域 >32MB 就别整块扫
+            hits = ff_find_pointers(pm, player, base, modsize,
+                                    lo=reg[0], hi=reg[1], chunk=0x100000, limit=32)
+            got = _pick(hits)
+            if got:
+                c.update({"pid": pid, "player": player, "addr": got[1],
+                          "idx": got[2], "count": got[0]})
+                return got[0], got[1]
+        # 2b) 再在 ±8MB 里找
+        hits = ff_find_pointers_near(pm, player, c["addr"], 0x800000, base, modsize, 32)
+        got = _pick(hits)
+        if got:
+            c.update({"pid": pid, "player": player, "addr": got[1],
+                      "idx": got[2], "count": got[0]})
+            return got[0], got[1]
+    _t0 = time.time()
+    got = _pick(ff_find_pointers(pm, player, base, modsize, limit=64))
+    if got:
+        c.update({"pid": pid, "player": player, "addr": got[1],
+                  "idx": got[2], "count": got[0]})
+        try:
+            app_log("[Actor] 全堆重查 %.2fs -> 数组=0x%X 数量=%d"
+                    % (time.time() - _t0, got[1], got[0]))
+        except Exception:
+            pass
+        return got[0], got[1]
+    return None
+def ff_attack_slot(pm, base):
+    """自动攻击目标槽地址(写怪物对象地址=自动攻击, 写 0=停止); 两条链都试, 一致才返回"""
+    a = b = 0
+    if OFF_ATTACK_SLOT_PTR:
+        p = _tp_i32(pm, base + OFF_ATTACK_SLOT_PTR)
+        if p:
+            a = p + ATTACK_SLOT_DELTA
+    if OFF_ATTACK_SLOT_PTR2:
+        p = _tp_i32(pm, base + OFF_ATTACK_SLOT_PTR2)
+        if p:
+            b = p + ATTACK_SLOT_DELTA2
+    if a and b:
+        return a if a == b else 0      # 两条链不一致 = 布局变了, 不瞎写
+    return a or b
+def set_attack_target(pm, base, obj):
+    """把怪物对象地址写进自动攻击槽; obj=0 停止攻击; 返回槽地址(失败返回 None)"""
+    slot = ff_attack_slot(pm, base)
+    if not slot:
+        return None
+    pm.write_uint(slot, int(obj) & 0xFFFFFFFF)
+    return slot
+# ======================= CE-FastFind 结束 =======================
+class DmInputBridge:
+    DM_CLSID = "26037A0E-7CBD-4FFF-9C63-56F2D0770214"
+
+    def __init__(self, app_dir=None, res_dir=None):
+        self.app_dir = app_dir or APP_DIR
+        self.res_dir = res_dir or RES_DIR
+        self.script_path = os.path.join(self.res_dir, "dm_bridge.ps1")
+        if not os.path.isfile(self.script_path):
+            self.script_path = os.path.join(self.app_dir, "dm_bridge.ps1")
+        self.config_path = os.path.join(self.app_dir, "dm_config.json")
+        default_config = os.path.join(self.res_dir, "dm_config.json")
+        if not os.path.isfile(self.config_path) and os.path.isfile(default_config):
+            try:
+                shutil.copyfile(default_config, self.config_path)
+            except Exception:
+                self.config_path = default_config
+        elif not os.path.isfile(self.config_path):
+            self.config_path = default_config
+        self.enabled = False
+        self.display = "gdi"
+        self.mouse = "windows"
+        self.keyboard = "windows"
+        self.mode = 0
+        self.reg_code = ""
+        self.reg_extra = ""
+        self.key_delay_ms = 30
+        self.bind_fallbacks = []
+        self.dll_path = ""
+        self._load_config()
+        self._lock = threading.RLock()
+        self._messages = queue.Queue()
+        self._proc = None
+        self._configured = False
+        self._bound_pid = 0
+        self._bound_hwnd = 0
+        self._last_error = ""
+        self._stderr_tail = ""
+        self._disabled = False
+        self._bind_fail_sig = None
+        self.version = ""
+        self.manual_pid = 0
+        self.manual_hwnd = 0
+        if self.enabled:
+            threading.Thread(target=self._warm, daemon=True).start()
+
+    def _load_config(self):
+        try:
+            with open(self.config_path, "r", encoding="utf-8-sig") as f:
+                cfg = json.load(f)
+        except Exception:
+            cfg = {}
+        self._raw_config = dict(cfg)
+        self.enabled = bool(cfg.get("enable", False))
+        self.display = str(cfg.get("display") or "gdi")
+        self.mouse = str(cfg.get("mouse") or "windows")
+        self.keyboard = str(cfg.get("keyboard") or "windows")
+        self.mode = int(cfg.get("mode", 0) or 0)
+        self.reg_code = str(cfg.get("reg_code") or "")
+        self.reg_extra = str(cfg.get("reg_extra") or "")
+        self.key_delay_ms = max(1, int(cfg.get("key_delay_ms", 30) or 30))
+        self.bind_fallbacks = []
+        for item in cfg.get("bind_fallbacks") or []:
+            try:
+                if len(item) >= 4:
+                    self.bind_fallbacks.append((str(item[0]), str(item[1]), str(item[2]), int(item[3])))
+            except Exception:
+                pass
+        name = str(cfg.get("dll") or "dm.dll")
+        if os.path.isabs(name):
+            self.dll_path = name
+        else:
+            candidates = [
+                os.path.join(self.app_dir, name),
+                os.path.join(self.res_dir, name),
+                os.path.join(r"D:\大漠插件\7.2607x-注册码\7.2607", name),
+            ]
+            self.dll_path = next((x for x in candidates if os.path.isfile(x)), candidates[0])
+
+    def _save_config(self):
+        try:
+            with open(self.config_path, "r", encoding="utf-8-sig") as f:
+                cfg = json.load(f)
+        except Exception:
+            cfg = dict(getattr(self, "_raw_config", {}) or {})
+        cfg["enable"] = bool(self.enabled)
+        cfg["display"] = str(self.display)
+        cfg["mouse"] = str(self.mouse)
+        cfg["keyboard"] = str(self.keyboard)
+        cfg["mode"] = int(self.mode)
+        cfg["reg_code"] = str(self.reg_code)
+        cfg["reg_extra"] = str(self.reg_extra)
+        cfg["key_delay_ms"] = int(self.key_delay_ms)
+        self._raw_config = dict(cfg)
+        try:
+            with open(self.config_path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _powershell32(self):
+        windir = os.environ.get("WINDIR") or r"C:\Windows"
+        p = os.path.join(windir, "SysWOW64", "WindowsPowerShell", "v1.0", "powershell.exe")
+        if os.path.isfile(p):
+            return p
+        p = os.path.join(windir, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+        return p if os.path.isfile(p) else ""
+
+    def set_enabled(self, enabled):
+        enabled = bool(enabled)
+        with self._lock:
+            if self.enabled == enabled:
+                return
+            self.enabled = enabled
+            self._save_config()
+            if enabled:
+                self._disabled = False
+                self._last_error = ""
+                self._bind_fail_sig = None
+                threading.Thread(target=self._warm, daemon=True).start()
+            else:
+                self.unbind()
+                self.close()
+
+    def save_settings(self, reg_code, reg_extra, display, mouse, keyboard, enabled=None):
+        with self._lock:
+            self.reg_code = str(reg_code or "").strip()
+            self.reg_extra = str(reg_extra or "").strip()
+            self.display = str(display or "gdi")
+            self.mouse = str(mouse or "windows")
+            self.keyboard = str(keyboard or "windows")
+            if enabled is not None:
+                self.enabled = bool(enabled)
+            self._save_config()
+            return True
+
+    def initialize_and_register(self, reg_code, reg_extra, display, mouse, keyboard):
+        with self._lock:
+            self.save_settings(reg_code, reg_extra, display, mouse, keyboard, enabled=True)
+            self.close()
+            self._disabled = False
+            self._last_error = ""
+            self._bind_fail_sig = None
+            return self.start()
+
+    def bind(self, pid, hwnd, manual=True):
+        with self._lock:
+            if manual:
+                self.manual_pid = int(pid or 0)
+                self.manual_hwnd = int(hwnd or 0)
+            return self._bind_locked(int(pid or 0), int(hwnd or 0))
+
+    def _warm(self):
+        if not self.enabled:
+            return
+        if self.start():
+            app_log("[大漠] 后台键鼠已就绪: %s" % (self.version or "?"))
+        elif self._last_error:
+            app_log("[大漠] 后台键鼠未就绪: %s" % self._last_error)
+
+    def _abort_worker_locked(self):
+        try:
+            if self._proc is not None and self._proc.poll() is None:
+                self._proc.kill()
+        except Exception:
+            pass
+        self._proc = None
+        self._configured = False
+        self._bound_pid = 0
+        self._bound_hwnd = 0
+
+    def _start_worker_locked(self):
+        if not self.enabled or self._disabled:
+            return False
+        if self._proc is not None and self._proc.poll() is None:
+            return True
+        if not os.path.isfile(self.script_path):
+            try:
+                cache_dir = os.path.join(tempfile.gettempdir(), "ths_dm_bridge")
+                os.makedirs(cache_dir, exist_ok=True)
+                tag = hashlib.sha256(DM_BRIDGE_PS1.encode("utf-8")).hexdigest()[:12]
+                cache_path = os.path.join(cache_dir, "dm_bridge_%s.ps1" % tag)
+                if not os.path.isfile(cache_path):
+                    with open(cache_path, "w", encoding="utf-8") as f:
+                        f.write(DM_BRIDGE_PS1)
+                self.script_path = cache_path
+            except Exception as exc:
+                self._last_error = "释放 dm_bridge.ps1 失败: %s" % exc
+                self._disabled = True
+                return False
+        if not os.path.isfile(self.script_path):
+            self._last_error = "缺少 dm_bridge.ps1"
+            self._disabled = True
+            return False
+        if not os.path.isfile(self.dll_path):
+            self._last_error = "缺少 dm.dll"
+            self._disabled = True
+            return False
+        ps = self._powershell32()
+        if not ps:
+            self._last_error = "缺少 32 位 PowerShell"
+            self._disabled = True
+            return False
+        cmd = [ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+               self.script_path, "-DllPath", self.dll_path]
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        self._messages = queue.Queue()
+        self._stderr_tail = ""
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                creationflags=flags,
+            )
+        except Exception as exc:
+            self._last_error = "启动大漠桥失败: %s" % exc
+            self._disabled = True
+            return False
+        threading.Thread(target=self._read_loop, args=(self._proc,), daemon=True).start()
+        threading.Thread(target=self._stderr_loop, args=(self._proc,), daemon=True).start()
+        deadline = time.time() + 20.0
+        while time.time() < deadline:
+            try:
+                msg = self._messages.get(timeout=max(0.1, deadline - time.time()))
+            except queue.Empty:
+                break
+            if isinstance(msg, dict) and msg.get("event") == "ready":
+                self.version = str(msg.get("version") or "")
+                return True
+            if isinstance(msg, dict) and msg.get("event") == "closed":
+                break
+        self._last_error = "大漠桥启动超时"
+        if self._stderr_tail.strip():
+            self._last_error += ": " + self._stderr_tail.strip()[-500:]
+        self._abort_worker_locked()
+        self._disabled = True
+        return False
+
+    def _read_loop(self, proc):
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    self._messages.put(json.loads(line))
+                except Exception:
+                    self._messages.put({"event": "text", "text": line})
+        except Exception:
+            pass
+        finally:
+            self._messages.put({"event": "closed"})
+
+    def _stderr_loop(self, proc):
+        try:
+            for line in proc.stderr:
+                self._stderr_tail = (self._stderr_tail + line)[-4000:]
+        except Exception:
+            pass
+
+    def _request_locked(self, payload, timeout=6.0):
+        if not self.enabled:
+            return None
+        if self._proc is None or self._proc.poll() is not None:
+            self._last_error = "大漠桥已退出"
+            self._abort_worker_locked()
+            return None
+        try:
+            req = dict(payload)
+            req["id"] = int(time.time() * 1000000) & 0x7FFFFFFF
+            self._proc.stdin.write(json.dumps(req, ensure_ascii=False) + "\n")
+            self._proc.stdin.flush()
+        except Exception as exc:
+            self._last_error = "写入大漠桥失败: %s" % exc
+            self._abort_worker_locked()
+            return None
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                msg = self._messages.get(timeout=max(0.05, deadline - time.time()))
+            except queue.Empty:
+                break
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("event") == "closed":
+                self._last_error = "大漠桥连接已关闭"
+                self._abort_worker_locked()
+                return None
+            if msg.get("id") == req["id"]:
+                if not msg.get("ok"):
+                    self._last_error = str(msg.get("error") or "大漠命令失败")
+                return msg
+        self._last_error = "大漠命令超时"
+        self._abort_worker_locked()
+        return None
+
+    def _configure_worker_locked(self):
+        if self._configured:
+            return True
+        if not self.enabled:
+            return False
+        resp = self._request_locked({"cmd": "setpath", "path": self.app_dir}, timeout=10.0)
+        if not resp or resp.get("result") != 1:
+            self._last_error = "大漠 SetPath 失败"
+            return False
+        if self.reg_code:
+            resp = self._request_locked({
+                "cmd": "reg",
+                "code": self.reg_code,
+                "extra": self.reg_extra,
+            }, timeout=20.0)
+            if not resp or resp.get("result") != 1:
+                code = resp.get("result") if isinstance(resp, dict) else "?"
+                self._last_error = "大漠注册失败: %s" % code
+                return False
+        self._configured = True
+        return True
+
+    def start(self):
+        with self._lock:
+            return self._start_worker_locked() and self._configure_worker_locked()
+
+    def _bind_locked(self, pid, hwnd):
+        if not self.enabled:
+            return False
+        if not pid or not hwnd:
+            self._last_error = "没有游戏窗口句柄"
+            return False
+        if self._bound_pid == pid and self._bound_hwnd == hwnd:
+            return True
+        if not self.start():
+            return False
+        try:
+            self._request_locked({"cmd": "unbind"})
+        except Exception:
+            pass
+        sig = (int(pid), int(hwnd))
+        candidates = [(self.display, self.mouse, self.keyboard, self.mode)]
+        candidates.extend(self.bind_fallbacks)
+        seen = set()
+        last_code = None
+        for display, mouse, keyboard, mode in candidates:
+            key = (display, mouse, keyboard, mode)
+            if key in seen:
+                continue
+            seen.add(key)
+            if str(mouse).lower() == "normal" or str(keyboard).lower() == "normal":
+                last_code = "已跳过前台键鼠模式"
+                continue
+            resp = self._request_locked({
+                "cmd": "bind",
+                "hwnd": int(hwnd),
+                "display": display,
+                "mouse": mouse,
+                "keyboard": keyboard,
+                "mode": int(mode),
+            }, timeout=10.0)
+            if resp and resp.get("result") == 1:
+                self._bound_pid = int(pid)
+                self._bound_hwnd = int(hwnd)
+                self._bind_fail_sig = None
+                app_log("[大漠] 绑定成功 hwnd=0x%X 模式=%s/%s/%s/%s"
+                        % (int(hwnd), display, mouse, keyboard, mode))
+                return True
+            if isinstance(resp, dict):
+                last_code = resp.get("last_error", resp.get("result"))
+        self._bound_pid = 0
+        self._bound_hwnd = 0
+        self._last_error = "大漠绑定失败: %s" % last_code
+        if self._bind_fail_sig != sig:
+            self._bind_fail_sig = sig
+            app_log(self._last_error)
+        return False
+
+    def press_key(self, vk, pid, hwnd):
+        if not self.enabled:
+            return False
+        with self._lock:
+            if not self._bind_locked(pid, hwnd):
+                return False
+            resp = self._request_locked({
+                "cmd": "keypress",
+                "vk": int(vk),
+                "delay": int(self.key_delay_ms),
+            })
+            return bool(resp and resp.get("ok") and resp.get("result") == 1)
+
+    def key_down(self, vk, pid, hwnd):
+        if not self.enabled:
+            return False
+        with self._lock:
+            if not self._bind_locked(pid, hwnd):
+                return False
+            resp = self._request_locked({"cmd": "keydown", "vk": int(vk)})
+            return bool(resp and resp.get("ok") and resp.get("result") == 1)
+
+    def key_up(self, vk, pid, hwnd):
+        if not self.enabled:
+            return False
+        with self._lock:
+            if not self._bind_locked(pid, hwnd):
+                return False
+            resp = self._request_locked({"cmd": "keyup", "vk": int(vk)})
+            return bool(resp and resp.get("ok") and resp.get("result") == 1)
+
+    def click(self, x, y, pid, hwnd, button="left"):
+        if not self.enabled:
+            return False
+        with self._lock:
+            if not self._bind_locked(pid, hwnd):
+                return False
+            resp = self._request_locked({
+                "cmd": "click",
+                "x": int(x),
+                "y": int(y),
+                "button": str(button or "left"),
+            })
+            return bool(resp and resp.get("ok") and resp.get("result") == 1)
+
+    def mouse_down(self, pid, hwnd, button="left"):
+        if not self.enabled:
+            return False
+        with self._lock:
+            if not self._bind_locked(pid, hwnd):
+                return False
+            resp = self._request_locked({"cmd": "down", "button": str(button or "left")})
+            return bool(resp and resp.get("ok") and resp.get("result") == 1)
+
+    def mouse_up(self, pid, hwnd, button="left"):
+        if not self.enabled:
+            return False
+        with self._lock:
+            if not self._bind_locked(pid, hwnd):
+                return False
+            resp = self._request_locked({"cmd": "up", "button": str(button or "left")})
+            return bool(resp and resp.get("ok") and resp.get("result") == 1)
+
+    def unbind(self):
+        with self._lock:
+            if self._proc is not None and self._proc.poll() is None:
+                self._request_locked({"cmd": "unbind"}, timeout=3.0)
+            self._bound_pid = 0
+            self._bound_hwnd = 0
+            self.manual_pid = 0
+            self.manual_hwnd = 0
+
+    def close(self):
+        with self._lock:
+            if self._proc is None:
+                return
+            try:
+                if self._proc.poll() is None:
+                    self._request_locked({"cmd": "quit"}, timeout=2.0)
+                    self._proc.wait(timeout=2.0)
+            except Exception:
+                pass
+            try:
+                if self._proc.poll() is None:
+                    self._proc.kill()
+            except Exception:
+                pass
+            self._proc = None
+            self._configured = False
+            self._bound_pid = 0
+            self._bound_hwnd = 0
+            self.manual_pid = 0
+            self.manual_hwnd = 0
+class GameMemory:
+    def __init__(self, pid=None, autobind=True):
+        self.pm = None
+        self.module_base = 0
+        self.module_size = 0
+        self.pid = None
+        self._hwnd = 0
+        self.last_error = ""
+        self.last_key_mode = ""
+        self._skip_vmt = {}          # VMT不在怪物白名单而被跳过的对象: {vmt: [名字, 次数]}
+        self._actor_lookup_failed = False
+        self._actor_fail_log = 0.0
+        self._move_cmd_lock = threading.RLock()
+        self._actors_cache_lock = threading.RLock()
+        self._actors_cache_data = None
+        self._actors_cache_at = 0.0
+        self._read_cache_lock = threading.RLock()
+        self._pos_cache_data = None
+        self._pos_cache_at = 0.0
+        self._hp_cache_data = None
+        self._hp_cache_at = 0.0
+        self._bag_cache_data = None
+        self._bag_cache_at = 0.0
+        self._items_cache_lock = threading.RLock()
+        self._items_cache_data = None
+        self._items_cache_at = 0.0
+        self._items_cache_key = None
+        self._move_cmd_seq = 0
+        self._last_move_cmd_at = 0.0
+        self._last_move_cmd_target = None
+        self._move_timer_id = 0
+        self._move_timer_hwnd = 0
+        self._pure_move_blk = 0
+        self._pure_move_callback = 0
+        self._pure_move_setup = 0
+        self.dm_input = DmInputBridge()
+        if pid:
+            self.attach_pid(pid)          # 用户指定 PID: 失败必须报错
+        elif autobind:
+            self.attach_quiet()           # 自动绑定: 失败不抛, 让界面先出来
+        # autobind=False: 启动时不绑, 等用户拖拽准星
+
+    def _clear_read_caches(self):
+        with self._actors_cache_lock:
+            self._actors_cache_data = None
+            self._actors_cache_at = 0.0
+        with self._read_cache_lock:
+            self._pos_cache_data = None
+            self._pos_cache_at = 0.0
+            self._hp_cache_data = None
+            self._hp_cache_at = 0.0
+            self._bag_cache_data = None
+            self._bag_cache_at = 0.0
+        with self._items_cache_lock:
+            self._items_cache_data = None
+            self._items_cache_at = 0.0
+            self._items_cache_key = None
+
+    def _probe_pid(self, pid, name=None):
+        """探测 PID 是否是目标游戏；成功返回信息 dict，失败抛异常。
+
+        name: 该进程的 exe 名。进程名/模块名和配置不一样时(微端随机名)用它兜底,
+              真正的校验还是靠模块大小 + 内存特征, 所以不会误绑到别的程序。
+        """
+        try:
+            pm = pymem.Pymem(pid)
+        except Exception as exc:
+            if "CouldNotOpenProcess" in type(exc).__name__ or "Could not open process" in str(exc):
+                raise RuntimeError("无法打开游戏进程，请用管理员身份运行本程序/PyCharm") from exc
+            raise
+
+        try:
+            module = pymem.process.module_from_name(pm.process_handle, MODULE_NAME)
+            _mod_used = MODULE_NAME
+            if not module and name and name.lower() != MODULE_NAME.lower():
+                # 进程名和配置不同(微端/别服客户端) -> 用它自己的 exe 名当模块名
+                module = pymem.process.module_from_name(pm.process_handle, name)
+                _mod_used = name
+            if not module:
+                raise RuntimeError(f"PID {pid} 中没有找到模块 {MODULE_NAME}")
+            if module.SizeOfImage < 5_000_000:
+                raise RuntimeError(f"PID {pid} 不是游戏主进程")
+
+            base = module.lpBaseOfDll
+            module_size = module.SizeOfImage
+            # 同名不同版本(启动器/旧客户端)的 SizeOfImage 不同, 按配置区分(留 64KB 容差)
+            if MODULE_SIZE and abs(module_size - MODULE_SIZE) > 0x10000:
+                raise RuntimeError(
+                    f"PID {pid} 模块大小 {module_size:#x} 与配置 {MODULE_SIZE:#x} 不符")
+            scene = 0
+            if OFF_PLAY_SCENE:
+                scene = pm.read_uint(base + OFF_PLAY_SCENE)
+                if not (0x10000 <= scene < 0x80000000):
+                    raise RuntimeError(f"PID {pid} 内存特征不匹配")
+            else:
+                # ACTOR_DYNAMIC 客户端: 没有静态场景指针, 改用"人物对象"做内存特征校验
+                _pv = pm.read_uint(base + OFF_PLAYER)
+                if 0x10000 <= _pv < 0x80000000:
+                    # 人物对象必须真的在, 且其 VMT 必须落在主模块内, 否则是同名别的 exe
+                    try:
+                        _vmt = pm.read_uint(_pv)
+                    except Exception:
+                        _vmt = 0
+                    if not (base <= _vmt < base + module_size):
+                        raise RuntimeError(
+                            f"PID {pid} 人物对象(VMT {_vmt:#x})不在模块内")
+
+            # 自动攻击对象指针：还没进地图时可能为 0，只用来判断“绑定哪个实例”
+            attack_obj = 0
+            for off in (OFF_AUTO_ATTACK_OBJ, OFF_AUTO_ATTACK_OBJ_ALT):
+                try:
+                    value = pm.read_uint(base + off)
+                except Exception:
+                    value = 0
+                if 0x10000 <= value < 0x80000000:
+                    attack_obj = value
+                    break
+
+            # 玩家对象（真正进了游戏才有）—— 用来挑出正确的那个实例
+            player = 0
+            try:
+                pv = pm.read_uint(base + OFF_PLAYER)
+                if 0x10000 <= pv < 0x80000000:
+                    player = pv
+            except Exception:
+                player = 0
+        except Exception:
+            try:
+                pm.close_process()
+            except Exception:
+                pass
+            raise
+
+        return {
+            "pid": pid,
+            "pm": pm,
+            "base": base,
+            "module_size": module_size,
+            "module_name": _mod_used,
+            "scene": scene,
+            "player": player,
+            "attack_obj": attack_obj,
+        }
+
+    def _apply_probe(self, info):
+        """把探测结果应用到当前对象（即切换绑定的进程）。"""
+        old = getattr(self, "pm", None)
+        old_pid = getattr(self, "pid", None)
+        if old is not None and old is not info["pm"]:
+            try:
+                self.stop_move()
+            except Exception:
+                pass
+            try:
+                self._destroy_move_timer()
+            except Exception:
+                pass
+        self._clear_read_caches()
+        self.pm = info["pm"]
+        self.module_base = info["base"]
+        self.module_size = info.get("module_size", 0)
+        self.pid = info["pid"]
+        if old_pid and old_pid != self.pid:
+            try:
+                self.dm_input.unbind()
+            except Exception:
+                pass
+        self._hwnd = 0
+        self._move_cmd_seq = 0
+        self._last_move_cmd_at = 0.0
+        self._last_move_cmd_target = None
+        self._move_timer_id = 0
+        self._move_timer_hwnd = 0
+        self._pure_move_blk = 0
+        self._pure_move_callback = 0
+        self._pure_move_setup = 0
+        if old is not None and old is not self.pm:
+            try:
+                old.close_process()
+            except Exception:
+                pass
+        # 进程名/模块名和配置不一样(微端随机名) -> 记住它, 存进 config.json 下次直接用
+        try:
+            _mn = str(info.get("module_name") or "")
+            global PROCESS_NAME, MODULE_NAME, PROC_NAME_OVERRIDE
+            if _mn and _mn.lower() != str(MODULE_NAME).lower():
+                PROCESS_NAME = _mn
+                MODULE_NAME = _mn
+                PROC_NAME_OVERRIDE = _mn
+                app_log("[绑定] 进程名与配置不同, 已改用 %s (会记进 config.json)" % _mn)
+        except Exception:
+            pass
+
+    def _try_attach_pid(self, pid, name=None):
+        self._apply_probe(self._probe_pid(pid, name))
+
+    def attach_pid(self, pid, name=None):
+        """name: 该进程的 exe 名(可选)。名字和配置不同时用它兜底绑定。"""
+        self._try_attach_pid(pid, name)
+
+    def detach(self):
+        """断开与游戏的绑定(不关游戏)"""
+        pm = self.pm
+        if pm is not None:
+            try:
+                self.stop_move()
+            except Exception:
+                pass
+            try:
+                self._destroy_move_timer()
+            except Exception:
+                pass
+        self._clear_read_caches()
+        try:
+            self.dm_input.unbind()
+        except Exception:
+            pass
+        self.pm = None
+        self.pid = None
+        self.module_base = 0
+        self.module_size = 0
+        self.last_error = ""
+        self._hwnd = 0
+        if pm is not None:
+            try:
+                pm.close_process()
+            except Exception:
+                pass
+
+    def attach_quiet(self):
+        """自动绑定: 失败不抛异常(界面先出来), 原因记在 last_error"""
+        try:
+            self.attach()
+            self.last_error = ""
+            return True
+        except Exception as exc:
+            self.last_error = str(exc)
+            return False
+
+    @property
+
+    def list_candidates(self):
+        """列出所有可能的游戏进程 [(pid, name), ...]，精确同名优先。"""
+        candidates = []
+        for proc in pymem.process.list_processes():
+            name = getattr(proc, "name", None) or getattr(proc, "szExeFile", "")
+            if isinstance(name, bytes):
+                name = name.decode(errors="ignore")
+            pid = getattr(proc, "pid", None) or getattr(proc, "th32ProcessID", None)
+            if not name or not pid:
+                continue
+            low = name.lower()
+            if low == PROCESS_NAME.lower() or "icq" in low or "mir" in low or "legend" in low:
+                candidates.append((pid, name))
+
+        if not candidates:
+            # 一个都没命中 -> 退一步: 列出"有可见窗口"的进程。
+            # 微端/别服客户端的 exe 名可能是随机的, 名字靠不住;
+            # 真正的判定交给 _probe_pid(模块大小 + 场景/人物对象等内存特征), 不是游戏的会探测失败。
+            _skip = {"explorer.exe", "cmd.exe", "powershell.exe", "pwsh.exe", "conhost.exe",
+                     "python.exe", "pythonw.exe", "天昊助手.exe", "cheatengine-i386.exe",
+                     "cheatengine-x86_64.exe", "taskmgr.exe", "searchapp.exe"}
+            seen = set()
+            for proc in pymem.process.list_processes():
+                name = getattr(proc, "name", None) or getattr(proc, "szExeFile", "")
+                if isinstance(name, bytes):
+                    name = name.decode(errors="ignore")
+                pid = getattr(proc, "pid", None) or getattr(proc, "th32ProcessID", None)
+                if not name or not pid or pid in seen:
+                    continue
+                low = name.lower()
+                if low in _skip:
+                    continue
+                try:
+                    if not pid_window_title(pid):       # 没窗口 -> 不是游戏
+                        continue
+                except Exception:
+                    continue
+                seen.add(pid)
+                candidates.append((pid, name))
+        # 排序: 精确同名最优先 -> 名字像传奇客户端(legend/mir/icq/chuanshi...) -> PID
+        def _rank(name):
+            low = str(name).lower()
+            return 0 if any(k in low for k in ("legend", "mir", "icq", "chuanqi", "chuanshi")) else 1
+        candidates.sort(key=lambda x: (0 if x[1].lower() == PROCESS_NAME.lower() else 1,
+                                       _rank(x[1]), x[0]))
+        return candidates
+
+    def attach(self):
+        """扫描并绑定最合适的游戏进程（优先“自动攻击对象”已创建的实例）。
+
+        游戏重开后 PID 会变，重新调用本方法即可重新绑定。
+        返回绑定信息 dict；找不到可用进程时抛 RuntimeError。
+        """
+        probed = []
+        errors = []
+        for pid, name in self.list_candidates():
+            try:
+                probed.append((self._probe_pid(pid, name), name))
+            except Exception as exc:
+                errors.append(f"{pid} {name}: {exc}")
+
+        if not probed:
+            msg = f"没有找到游戏进程：{PROCESS_NAME}"
+            if errors:
+                msg += "\n\n尝试过的同名/相关进程：\n" + "\n".join(errors[-10:])
+            raise RuntimeError(msg)
+
+        # 已进入地图（自动攻击对象已创建）的实例优先，避免绑到启动器/多开小号
+        probed.sort(key=lambda item: (
+            0 if item[0].get("player") else 1,
+            0 if item[0].get("attack_obj") else 1))
+        chosen = probed[0][0]
+
+        # 关掉其它实例的句柄
+        for other, _name in probed[1:]:
+            try:
+                other["pm"].close_process()
+            except Exception:
+                pass
+
+        self._apply_probe(chosen)
+        return chosen
+
+    # ---------- 基础读写 ----------
+    # 未绑定时所有读都返回 0/空串(界面先在, 绑定是后一步的事)
+    def read_u8(self, addr):
+        if self.pm is None:
+            return 0
+        return self.pm.read_uchar(addr)
+
+    def read_u16(self, addr):
+        if self.pm is None:
+            return 0
+        return self.pm.read_ushort(addr)
+
+
+    def read_u32(self, addr):
+        if self.pm is None:
+            return 0
+        return self.pm.read_uint(addr)
+
+    def read_i32(self, addr):
+        if self.pm is None:
+            return 0
+        return self.pm.read_int(addr)
+
+    def read_cstring(self, ptr, max_len=64):
+        if self.pm is None:
+            return ""
+        if not ptr or ptr < 0x10000:
+            return ""
+        raw = self.pm.read_bytes(ptr, max_len)
+        raw = raw.split(b"\x00", 1)[0]
+        for enc in ("gbk", "utf-8"):
+            try:
+                return raw.decode(enc)
+            except UnicodeDecodeError:
+                continue
+        return raw.decode("latin1", errors="ignore")
+    def read_shortstring(self, addr, max_len=40):
+        """读取 Delphi ShortString: [长度字节][GBK字符串]"""
+        try:
+            ln = self.read_u8(addr)
+        except Exception:
+            return ""
+        if not (0 < ln <= max_len):
+            return ""
+        try:
+            raw = self.pm.read_bytes(addr + 1, ln)
+        except Exception:
+            return ""
+        raw = raw.split(b"\x00", 1)[0]
+        for enc in ("gbk", "utf-8"):
+            try:
+                return raw.decode(enc)
+            except UnicodeDecodeError:
+                continue
+        return raw.decode("latin1", errors="ignore")
+
+    def get_bag(self):
+        """背包 40 格 -> [{'slot':1..40, 'name':str, 'used':bool, 'category_id':int}, ...]"""
+        now = time.time()
+        data = self._bag_cache_data
+        if data is not None and (now - self._bag_cache_at) < BAG_CACHE_SEC:
+            return data
+        with self._read_cache_lock:
+            now = time.time()
+            data = self._bag_cache_data
+            if data is not None and (now - self._bag_cache_at) < BAG_CACHE_SEC:
+                return data
+            rows = []
+            base = self.module_base + OFF_BAG_SLOT1 if self.module_base else 0
+            raw = None
+            if base:
+                try:
+                    raw = self.pm.read_bytes(base, BAG_SLOT_COUNT * BAG_SLOT_SIZE)
+                except Exception:
+                    raw = None
+            if base:
+                for i in range(BAG_SLOT_COUNT):
+                    off = i * BAG_SLOT_SIZE
+                    name = ""
+                    category_id = 0
+                    if raw is not None:
+                        ln = raw[off]
+                        if 0 < ln <= 40 and off + 1 + ln <= len(raw):
+                            value = raw[off + 1:off + 1 + ln].split(b"\x00", 1)[0]
+                            for enc in ("gbk", "utf-8"):
+                                try:
+                                    name = value.decode(enc)
+                                    break
+                                except UnicodeDecodeError:
+                                    continue
+                            else:
+                                name = value.decode("latin1", errors="ignore")
+                        if name:
+                            category_id = raw[off + BAG_CATEGORY_ID_OFF]
+                    else:
+                        try:
+                            name = self.read_shortstring(base + off)
+                        except Exception:
+                            name = ""
+                        category_id = self.read_u8(base + off + BAG_CATEGORY_ID_OFF) if name else 0
+                    rows.append({"slot": i + 1, "name": name or "", "used": bool(name),
+                                 "category_id": category_id})
+            self._bag_cache_data = rows
+            self._bag_cache_at = time.time()
+            return rows
+
+
+    # ---------- 游戏数据 ----------
+    def _note_skipped_actor(self, vmt, name):
+        """记下因 VMT 不在怪物白名单而被跳过的对象(内部计数, 不写日志, 界面不显示)
+
+        只记 VMT 落在主模块内的对象(真对象的 VMT 一定在模块里);
+        野指针/垃圾值 VMT 不在模块内 -> 直接丢。
+        """
+        try:
+            base = self.module_base
+            size = self.module_size
+            if not base or not size or not (base <= vmt < base + size):
+                return
+            seen = self._skip_vmt
+            rec = seen.get(vmt)
+            if rec is None:
+                seen[vmt] = [name, 1]
+            else:
+                rec[1] += 1
+                if name and not rec[0]:
+                    rec[0] = name
+            if len(seen) > 300:
+                for k in list(seen.keys())[:-300]:
+                    seen.pop(k, None)
+        except Exception:
+            pass
+
+    def _scan_timed(self, name, fn):
+        """给 get_actors/get_items 计时: 慢机器上这两个才是瓶颈, 也让时间窗能跟着机器速度走"""
+        _t0 = time.time()
+        try:
+            return fn()
+        finally:
+            try:
+                _ms = (time.time() - _t0) * 1000.0
+                _c = getattr(self, "_scan_cost", None)
+                if not isinstance(_c, dict):
+                    _c = {}
+                _c[name] = _ms
+                self._scan_cost = _c
+                _slow = max(_c.get("actors", 0.0), _c.get("items", 0.0))
+                if _slow >= SELFSCAN_LOG_MS and (time.time() - getattr(self, "_scan_log_at", 0.0)) >= 10.0:
+                    self._scan_log_at = time.time()
+                    app_log("[性能] 扫描慢: get_actors %.0f ms / get_items %.0f ms"
+                            " (慢机器会把'等掉落/卡位'的时间窗吃掉)"
+                            % (_c.get("actors", 0.0), _c.get("items", 0.0)))
+            except Exception:
+                pass
+
+
+    def get_actors(self):
+        now = time.time()
+        data = self._actors_cache_data
+        if data is not None and (now - self._actors_cache_at) < ACTOR_CACHE_SEC:
+            return data
+        with self._actors_cache_lock:
+            now = time.time()
+            data = self._actors_cache_data
+            if data is not None and (now - self._actors_cache_at) < ACTOR_CACHE_SEC:
+                return data
+            data = self._scan_timed("actors", self._get_actors_impl)
+            self._actors_cache_data = data
+            self._actors_cache_at = time.time()
+            return data
+
+    def _get_actors_impl(self):
+        if ACTOR_DYNAMIC:
+            found = ff_find_actor_array(self.pm, self.module_base, self.module_size)
+            if not found:
+                self._actor_lookup_failed = True
+                _now = time.time()
+                if _now - self._actor_fail_log >= 10.0:
+                    self._actor_fail_log = _now
+                    try:
+                        app_log("[Actor] 这一轮没反查到怪物数组(界面保留上次列表)")
+                    except Exception:
+                        pass
+                return []
+            self._actor_lookup_failed = False
+            count, array = found
+        else:
+            self._actor_lookup_failed = False
+            scene = self.read_u32(self.module_base + OFF_PLAY_SCENE)
+            if not scene:
+                return []
+            actor_list = self.read_u32(scene + OFF_ACTOR_LIST)
+            if not actor_list:
+                return []
+            count = self.read_u32(actor_list + OFF_ACTOR_COUNT)
+            array = self.read_u32(actor_list + OFF_ACTOR_ARRAY)
+        if count <= 0 or count > 500 or not array:
+            return []
+
+        record_size = max(
+            0x20,
+            int(OFF_CATEGORY) + 1,
+            int(OFF_NAME) + 4,
+            int(OFF_X) + 4,
+            int(OFF_Y) + 4,
+            int(MONSTER_HP) + 2,
+            int(MONSTER_MAX_HP) + 2,
+            (int(MONSTER_DEAD_OFF) + 1) if MONSTER_DEAD_OFF else 0,
+            0xCE,
+        )
+        result = []
+        try:
+            _me = self.read_u32(self.module_base + OFF_PLAYER)
+        except Exception:
+            _me = 0
+        _others = []
+        try:
+            raw_array = self.pm.read_bytes(array, count * 4)
+        except Exception:
+            raw_array = None
+        for i in range(count):
+            try:
+                if raw_array is not None:
+                    actor = struct.unpack_from("<I", raw_array, i * 4)[0]
+                else:
+                    actor = self.read_u32(array + i * 4)
+            except Exception:
+                continue
+            if not actor or actor < 0x10000 or actor >= 0x80000000:
+                continue
+            try:
+                rec = self.pm.read_bytes(actor, record_size)
+                vmt = struct.unpack_from("<I", rec, 0)[0]
+                cat = rec[int(OFF_CATEGORY)]
+                name_ptr = struct.unpack_from("<I", rec, int(OFF_NAME))[0]
+                x = struct.unpack_from("<i", rec, int(OFF_X))[0]
+                y = struct.unpack_from("<i", rec, int(OFF_Y))[0]
+                max_hp = struct.unpack_from("<H", rec, int(MONSTER_MAX_HP))[0]
+                hp = struct.unpack_from("<H", rec, int(MONSTER_HP))[0]
+                dead = rec[int(MONSTER_DEAD_OFF)] if MONSTER_DEAD_OFF else 0
+
+                if cat == 1:
+                    if actor != _me:
+                        _others.append({
+                            "actor": actor,
+                            "name": self.read_cstring(name_ptr) or "",
+                            "x": x,
+                            "y": y,
+                        })
+                    continue
+                if cat == 4:
+                    continue
+
+                name = self.read_cstring(name_ptr) or ""
+                if MONSTER_VMTS and vmt not in MONSTER_VMTS:
+                    self._note_skipped_actor(vmt, name)
+                if not name.strip():
+                    continue
+                if "(" in name or "（" in name:
+                    continue
+                if any(kw in name for kw in NPC_KEYWORDS):
+                    continue
+                if TRAP_VMTS and vmt in TRAP_VMTS:
+                    continue
+                if TRAP_MARK1 or TRAP_MARKS:
+                    _c8 = struct.unpack_from("<H", rec, 0xC8)[0]
+                    _cc = struct.unpack_from("<H", rec, 0xCC)[0]
+                    _trap = bool(TRAP_MARK1 and _c8 == TRAP_MARK1 and _cc == TRAP_MARK2)
+                    if not _trap:
+                        for _sig in (TRAP_MARKS or ()):
+                            try:
+                                if _c8 == int(_sig[0]) and _cc == int(_sig[1]):
+                                    _trap = True
+                                    break
+                            except Exception:
+                                pass
+                    if _trap:
+                        continue
+                if not (0 < max_hp < 100000) or hp > max_hp:
+                    max_hp = 0
+                    hp = 0
+                if COUNT_ALIVE_ONLY:
+                    if MONSTER_DEAD_OFF and dead:
+                        continue
+                    if hp == 0 and max_hp > 0:
+                        continue
+                result.append({
+                    "index": i,
+                    "actor": actor,
+                    "name": name or "未知怪物",
+                    "x": x,
+                    "y": y,
+                    "hp": hp,
+                    "max_hp": max_hp,
+                    "dead": dead,
+                })
+            except Exception:
+                continue
+
+        try:
+            if _me:
+                px = self.read_i32(_me + OFF_X)
+                py = self.read_i32(_me + OFF_Y)
+                result = [m for m in result
+                          if max(abs(m["x"] - px), abs(m["y"] - py)) <= MONSTER_MAX_DIST]
+        except Exception:
+            pass
+        self._other_players = _others
+        return result
+
+    def other_players(self):
+        """上一轮 get_actors() 扫到的"别的玩家"(cat=1 且不是自己) -> [{actor,name,x,y}, ...]"""
+        return list(getattr(self, "_other_players", []) or [])
+
+    PLAYER_HP_OFF = 0x112        # 玩家当前血(和怪物同偏移, 实测 200/200)
+    PLAYER_MAXHP_OFF = 0x11A     # 玩家最大血
+
+    # ★宠物死活只看这个, 别用血量! 实测(2026-10-14 同一只宝宝 1EAC5D60 活->死对比):
+    #   +0xAC: 0 = 活着, 1 = 尸体(死亡标志位)
+    #   血量更坑: +0x112 恒为 0, +0x118 是 16.16 定点且"死时才是满血" -> 完全没用, 已删。
+    PET_DEAD_OFF = 0xAC
+
+    PLAYER_STATUS_OFF = 0xA8     # 人物状态位集合
+    PLAYER_HIDDEN_BIT = 0x100    # 隐身状态位
+
+    WEIGHT_OFF = 0x12A           # 玩家对象 + 0x12A = 当前背包重量 (word)
+    WEIGHT_MAX_OFF = 0x12C       # 玩家对象 + 0x12C = 最大负重   (word)
+
+    def get_weight(self):
+        """返回 (当前重量, 最大负重); 读不到返回 (0,0)"""
+        try:
+            p = self.read_u32(self.module_base + OFF_PLAYER)
+            if not p:
+                return 0, 0
+            w = self.read_u16(p + self.WEIGHT_OFF)
+            wm = self.read_u16(p + self.WEIGHT_MAX_OFF)
+            if not (0 < wm < 100000) or w > wm:
+                return 0, 0
+            return w, wm
+        except Exception:
+            return 0, 0
+
+    def get_player_hp(self):
+        """返回 (当前血, 最大血); 读不到返回 (0, 0)"""
+        now = time.time()
+        data = self._hp_cache_data
+        if data is not None and (now - self._hp_cache_at) < PLAYER_HP_CACHE_SEC:
+            return data
+        with self._read_cache_lock:
+            now = time.time()
+            data = self._hp_cache_data
+            if data is not None and (now - self._hp_cache_at) < PLAYER_HP_CACHE_SEC:
+                return data
+            try:
+                p = self.read_u32(self.module_base + OFF_PLAYER)
+                if not p:
+                    data = (0, 0)
+                else:
+                    hp = self.read_u32(p + self.PLAYER_HP_OFF)
+                    mx = self.read_u32(p + self.PLAYER_MAXHP_OFF)
+                    data = (hp, mx) if 0 < mx < 1000000 and hp <= mx else (0, 0)
+            except Exception:
+                data = (0, 0)
+            self._hp_cache_data = data
+            self._hp_cache_at = time.time()
+            return data
+
+    def _dm_window(self):
+        try:
+            hwnd = self.find_window()
+            if hwnd:
+                root = ctypes.windll.user32.GetAncestor(hwnd, 2)
+                return root or hwnd
+        except Exception:
+            pass
+        try:
+            target_pid = int(self.pid or 0)
+            if not target_pid:
+                return 0
+            user32 = ctypes.windll.user32
+            result = [0]
+            WNDENUMPROC = ctypes.WINFUNCTYPE(
+                ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+
+            def cb(hwnd, _lparam):
+                pid = ctypes.wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if pid.value == target_pid and user32.IsWindowVisible(hwnd):
+                    result[0] = int(hwnd)
+                    return False
+                return True
+
+            user32.EnumWindows(WNDENUMPROC(cb), 0)
+            return result[0]
+        except Exception:
+            return 0
+
+    def _dm_target(self):
+        return self.pid, self._dm_window()
+
+    def _game_minimized(self):
+        try:
+            hwnd = self._dm_target()[1] or self.find_window()
+            return bool(hwnd and ctypes.windll.user32.IsIconic(hwnd))
+        except Exception:
+            return False
+
+    def is_window_hung(self):
+        if not self.pid:
+            return False
+        try:
+            hwnd = self._dm_target()[1] or self.find_window()
+            if not hwnd:
+                return False
+            return bool(ctypes.windll.user32.IsHungAppWindow(hwnd))
+        except Exception:
+            return False
+
+    def press_key(self, vk, real=None, also_post=False, to_root=False, tag=""):
+        """发送按键。
+
+        大漠后台键鼠启用时只使用大漠按键；未启用时发送普通键盘输入。
+        """
+        if self.dm_input.enabled:
+            dm_pid, dm_hwnd = self._dm_target()
+            ok = self.dm_input.press_key(vk, dm_pid, dm_hwnd)
+            _n = getattr(GameMemory, "_dm_key_fail_n", 0)
+            if ok:
+                self.last_key_mode = "dm"
+                if not getattr(self, "_dm_key_logged", 0):
+                    self._dm_key_logged = 1
+                    app_log("KEY: 大漠后台按键 vk=0x%X hwnd=0x%X" % (vk, dm_hwnd or 0))
+                return True
+            self.last_key_mode = "dm_failed"
+            GameMemory._dm_key_fail_n = _n + 1
+            if _n == 0 or (_n + 1) % 50 == 0:
+                app_log("KEY: 大漠按键失败 vk=0x%X hwnd=0x%X err=%s"
+                        % (vk, dm_hwnd or 0, self.dm_input._last_error))
+            return False
+
+        try:
+            hwnd = self.find_window()
+        except Exception:
+            hwnd = getattr(self, "_hwnd", 0) or 0
+        if not hwnd:
+            hwnd = self._dm_window()
+        if not hwnd:
+            app_log("KEY: 未找到游戏窗口，前台按键取消")
+            return False
+        user32 = ctypes.windll.user32
+        scan = user32.MapVirtualKeyW(vk, 0) & 0xFF
+        _pk_n = getattr(GameMemory, "_pk_log_n", 0) + 1
+        GameMemory._pk_log_n = _pk_n
+        if _pk_n <= 20 or _pk_n % 50 == 0:
+            try:
+                app_log("KEY: 前台按键 vk=0x%X hwnd=0x%X" % (vk, hwnd))
+            except Exception:
+                pass
+        self.last_key_mode = "normal"
+        self._send_input(vk, scan)
+        return True
+
+    @staticmethod
+    def _send_input(vk, scan):
+        """真实键盘输入。
+
+        **实测结论(2026-10-08, 用户复现)**:
+        这个客户端要 **SendInput + keybd_event 各发一遍** 才稳;
+        只发其中一种(或改成先发 scan code) 会退化成
+        “只有第一次有效”。
+        之前按“去重复注入”的理论去优化，反而把能用的改坏了（已回退）。
+        保留: 前 3 次日志降频。
+        """
+        user32 = ctypes.windll.user32
+        ULONG_PTR = (ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8
+                     else ctypes.c_ulong)
+
+        class KEYBDINPUT(ctypes.Structure):
+            _fields_ = [("wVk", ctypes.wintypes.WORD),
+                        ("wScan", ctypes.wintypes.WORD),
+                        ("dwFlags", ctypes.wintypes.DWORD),
+                        ("time", ctypes.wintypes.DWORD),
+                        ("dwExtraInfo", ULONG_PTR)]
+
+        class _INPUTUNION(ctypes.Union):
+            _fields_ = [("ki", KEYBDINPUT),
+                        ("pad", ctypes.c_ubyte * 24)]
+
+        class INPUT(ctypes.Structure):
+            _fields_ = [("type", ctypes.wintypes.DWORD),
+                        ("u", _INPUTUNION)]
+
+        KEYUP = 0x0002
+
+        def _si(flags):
+            try:
+                a = (INPUT * 1)()
+                a[0].type = 1
+                a[0].u.ki = KEYBDINPUT(vk, scan, flags, 0, 0)
+                user32.SendInput(1, ctypes.byref(a), ctypes.sizeof(INPUT))
+            except Exception:
+                pass
+
+        _log_n = getattr(GameMemory, "_si_log_n", 0) + 1
+        GameMemory._si_log_n = _log_n
+        if _log_n <= 3 or _log_n % 50 == 0:
+            try:
+                app_log("KEY: _send_input vk=0x%X 前台窗口=0x%X 第%d次"
+                        % (vk, user32.GetForegroundWindow(), _log_n))
+            except Exception:
+                pass
+
+        # 按下: SendInput + keybd_event 各一遍(实测只有这样连续按才次次生效)
+        _si(0)
+        try:
+            user32.keybd_event(vk, scan, 0, 0)
+        except Exception:
+            pass
+        time.sleep(0.06)
+
+        # 松开: 同样两种都发
+        _si(KEYUP)
+        try:
+            user32.keybd_event(vk, scan, KEYUP, 0)
+        except Exception:
+            pass
+        time.sleep(0.03)
+
+    def get_player_pos(self):
+        now = time.time()
+        data = self._pos_cache_data
+        if data is not None and (now - self._pos_cache_at) < PLAYER_POS_CACHE_SEC:
+            return data
+        with self._read_cache_lock:
+            now = time.time()
+            data = self._pos_cache_data
+            if data is not None and (now - self._pos_cache_at) < PLAYER_POS_CACHE_SEC:
+                return data
+            player = self.read_u32(self.module_base + OFF_PLAYER)
+            if not player:
+                data = (0, 0)
+            else:
+                data = (self.read_i32(player + OFF_X), self.read_i32(player + OFF_Y))
+            self._pos_cache_data = data
+            self._pos_cache_at = time.time()
+            return data
+
+    def is_player_hidden(self):
+        """人物隐身状态位: +0xA8 的 0x100 位。"""
+        try:
+            player = self.read_u32(self.module_base + OFF_PLAYER)
+            if not player:
+                return False
+            status = self.read_u32(player + self.PLAYER_STATUS_OFF)
+            return bool(status & self.PLAYER_HIDDEN_BIT)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _pet_owner_name(name):
+        """从宠物名称中提取括号内的主人名，如 变异骷髅(柠檬茶)。"""
+        for left, right in (("(", ")"), ("（", "）")):
+            start = name.rfind(left)
+            end = name.find(right, start + 1)
+            if start >= 0 and end > start + 1:
+                return name[start + 1:end].strip()
+        return ""
+
+    def _pet_rec(self, actor):
+        """对象 -> 宝宝 dict; 不是"自己的宠物"或结构不对 -> None
+
+        死活只看 +0xAC(0=活, 1=尸体); 血量字段对宠物不可信(活的时候读 0, 死了反而写成满血), 不读。
+        """
+        try:
+            if self.read_u8(actor + OFF_CATEGORY) != 4:
+                return None
+            name = self.read_cstring(self.read_u32(actor + OFF_NAME))
+            if not name:
+                return None
+            player = self.read_u32(self.module_base + OFF_PLAYER)
+            if player:
+                self._pet_player_cache = player
+            else:
+                player = getattr(self, "_pet_player_cache", 0)
+            if not player:
+                return None
+            pname = ""
+            try:
+                pname = self.read_cstring(self.read_u32(player + OFF_NAME)).strip()
+            except Exception:
+                pname = ""
+            if pname:
+                self._pet_owner_cache = pname
+            else:
+                pname = getattr(self, "_pet_owner_cache", "")
+            if not pname or self._pet_owner_name(name) != pname:
+                return None
+            try:
+                _dead = (self.read_u8(actor + self.PET_DEAD_OFF) or 0) != 0
+            except Exception:
+                _dead = False
+            _vmt = 0
+            try:
+                _vmt = self.read_u32(actor) or 0
+            except Exception:
+                pass
+            if _vmt:
+                # 记下来: _pet_direct() 靠这个 VMT 确认"这个地址还是宝宝对象"
+                self._pet_vmt_hint = _vmt
+            return {
+                "actor": actor,
+                "vmt": _vmt,
+                "name": name,
+                "x": self.read_i32(actor + OFF_X),
+                "y": self.read_i32(actor + OFF_Y),
+                "alive": not _dead,
+            }
+        except Exception:
+            return None
+
+    def _pet_direct(self, addr):
+        """直接读一个已知对象地址: 还是自己的宝宝吗? 返回 dict / None(对象没了/不是宝宝)
+
+        宝宝停在远处只是掉出 ActorList, 对象一直在内存里、地址不变, 所以直读最省事。
+        """
+        if not addr:
+            return None
+        want = set()
+        for v in (PET_VMTS or ()):
+            try:
+                want.add(int(v))
+            except Exception:
+                pass
+        _hv = getattr(self, "_pet_vmt_hint", 0)
+        if _hv:
+            want.add(int(_hv))
+        try:
+            if want and self.read_u32(addr) not in want:
+                return None
+        except Exception:
+            return None
+        return self._pet_rec(addr)
+
+    def get_pet(self):
+        """自己的宝宝(cat==4 + 名字带 (主人名))。
+
+        ① 先扫 ActorList(宝宝在附近时一定在里面)
+        ② 列表里没有活体 -> 直读上次那个宝宝对象的地址(停远处只是掉出列表, 对象还在)
+        返回活体优先, 尸体兜底; 都没有 -> None。
+        """
+        _alive = None
+        _corpse = None
+        self._pet_src = "none"
+        try:
+            scene = self.read_u32(self.module_base + OFF_PLAY_SCENE)
+            actor_list = self.read_u32(scene + OFF_ACTOR_LIST) if scene else 0
+            if actor_list:
+                count = self.read_u32(actor_list + OFF_ACTOR_COUNT)
+                array = self.read_u32(actor_list + OFF_ACTOR_ARRAY)
+                if 0 < count <= 500 and array:
+                    for i in range(count):
+                        actor = self.read_u32(array + i * 4)
+                        if not actor:
+                            continue
+                        rec = self._pet_rec(actor)
+                        if rec is None:
+                            continue
+                        if rec["alive"]:
+                            self._pet_hint = actor
+                            self._pet_src = "list"
+                            _alive = rec
+                            break
+                        if _corpse is None:
+                            _corpse = rec
+                            if not getattr(self, "_pet_hint", 0):
+                                self._pet_hint = actor
+        except Exception:
+            pass
+        if _alive is None:
+            rec = self._pet_direct(getattr(self, "_pet_hint", 0))
+            if rec is not None:
+                if rec["alive"]:
+                    _alive = rec
+                    self._pet_src = "direct"
+                elif _corpse is None:
+                    _corpse = rec
+        return _alive or _corpse
+
+    # ---------- 窗口 / 自动攻击 ----------
+    def get_player(self):
+        try:
+            return self.read_u32(self.module_base + OFF_PLAYER)
+        except Exception:
+            return 0
+
+
+
+    def game_is_foreground(self):
+        """游戏窗口(或它的顶层窗口)是不是当前前台窗口。
+
+        真实按键(SendInput/keybd_event) 只会发给前台窗口, 所以发之前必须先问这一句。
+        """
+        try:
+            user32 = ctypes.windll.user32
+            fg = user32.GetForegroundWindow()
+            if not fg:
+                return False
+            hwnd = self.find_window()
+            if hwnd and (fg == hwnd or fg == (user32.GetAncestor(hwnd, 2) or hwnd)):
+                return True
+            pid = ctypes.c_ulong()
+            user32.GetWindowThreadProcessId(fg, ctypes.byref(pid))
+            return bool(self.pid) and pid.value == self.pid
+        except Exception:
+            return False
+
+    def find_window(self):
+        """查找游戏输入窗口；优先 TfrmWinCtrls（可能是子窗口）。"""
+        user32 = ctypes.windll.user32
+
+        if self._hwnd:
+            try:
+                if user32.IsWindow(self._hwnd):
+                    pid = ctypes.c_ulong()
+                    user32.GetWindowThreadProcessId(self._hwnd, ctypes.byref(pid))
+                    if pid.value == self.pid:
+                        cls = ctypes.create_unicode_buffer(256)
+                        user32.GetClassNameW(self._hwnd, cls, 256)
+                        cname = cls.value or ""
+                        if "TfrmWinCtrls" in cname or "frmWinCtrls" in cname:
+                            return self._hwnd
+            except Exception:
+                pass
+            self._hwnd = 0
+
+        preferred = []
+        top_windows = []
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        def _child_cb(hwnd, _lparam):
+            try:
+                cls = ctypes.create_unicode_buffer(256)
+                user32.GetClassNameW(hwnd, cls, 256)
+                cname = cls.value or ""
+                if "TfrmWinCtrls" in cname or "frmWinCtrls" in cname:
+                    if user32.IsWindowVisible(hwnd):
+                        r = ctypes.wintypes.RECT()
+                        user32.GetWindowRect(hwnd, ctypes.byref(r))
+                        w = r.right - r.left
+                        h = r.bottom - r.top
+                        if w >= 160 and h >= 120:
+                            preferred.append((w * h, hwnd))
+            except Exception:
+                pass
+            return True
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        def _top_cb(hwnd, _lparam):
+            try:
+                pid = ctypes.c_ulong()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if pid.value == self.pid and user32.IsWindowVisible(hwnd):
+                    r = ctypes.wintypes.RECT()
+                    user32.GetWindowRect(hwnd, ctypes.byref(r))
+                    w = r.right - r.left
+                    h = r.bottom - r.top
+                    if w >= 160 and h >= 120:
+                        top_windows.append((w * h, hwnd))
+
+                    cls = ctypes.create_unicode_buffer(256)
+                    user32.GetClassNameW(hwnd, cls, 256)
+                    cname = cls.value or ""
+                    if "TfrmWinCtrls" in cname or "frmWinCtrls" in cname:
+                        preferred.append((max(1, w * h), hwnd))
+
+                    user32.EnumChildWindows(hwnd, _child_cb, 0)
+            except Exception:
+                pass
+            return True
+
+        user32.EnumWindows(_top_cb, 0)
+
+        if preferred:
+            preferred.sort(key=lambda t: -t[0])
+            self._hwnd = preferred[0][1]
+        elif top_windows:
+            top_windows.sort(key=lambda t: -t[0])
+            self._hwnd = top_windows[0][1]
+        else:
+            return 0
+        return self._hwnd
+
+    def auto_attack_slot_addr(self):
+        """解析“自动打怪槽”的运行时地址。
+
+        0x0A65ABC4 只是堆内动态地址(临时地址)，每次重启游戏都会改变，
+        必须通过静态指针链定位：
+            主链: [icqs5rhqqp.exe+0x28A470] + 0x3B4  -> 该槽地址
+            备链: [icqs5rhqqp.exe+0x2B87B4] + 0x1B4  -> 同一地址
+        两条链都不可用时，退回旧的硬编码地址。
+        """
+        base = self.module_base
+        # 新客户端(ACTOR_DYNAMIC): 用两条静态链互校, 不一致就返回 0(宁可不写)
+        if OFF_ATTACK_SLOT_PTR or OFF_ATTACK_SLOT_PTR2:
+            slot = ff_attack_slot(self.pm, base)
+            return slot or 0
+        for obj_off, slot_off in (
+            (OFF_AUTO_ATTACK_OBJ, OFF_AUTO_ATTACK_SLOT),
+            (OFF_AUTO_ATTACK_OBJ_ALT, OFF_AUTO_ATTACK_SLOT_ALT),
+        ):
+            try:
+                obj = self.pm.read_uint(base + obj_off)
+            except Exception:
+                obj = 0
+            if 0x10000 <= obj < 0x80000000:
+                return obj + slot_off
+        return AUTO_ATTACK_SLOT
+
+    def set_attack_target(self, actor):
+        if not actor:
+            return
+        # 主：写自动攻击槽（实测有效）
+        slot = self.auto_attack_slot_addr()
+        if slot:
+            self.pm.write_uint(slot, actor)
+        # 辅：同时写 g_TargetCret（游戏自己的目标记录）; 该客户端没配(0)就跳过,
+        #     否则会写到模块头 MZ 那一页去
+        if OFF_TARGET_CRET:
+            try:
+                self.pm.write_uint(self.module_base + OFF_TARGET_CRET, actor)
+            except Exception:
+                pass
+
+    def clear_attack_target(self):
+        slot = self.auto_attack_slot_addr()
+        if slot:
+            try:
+                self.pm.write_uint(slot, 0)
+            except Exception:
+                pass
+        if OFF_TARGET_CRET:
+            try:
+                self.pm.write_uint(self.module_base + OFF_TARGET_CRET, 0)
+            except Exception:
+                pass
+
+
+
+
+
+
+    ITEM_SLOT0 = 0x0A70B9C4      # (旧裸地址, 已弃用)
+    OFF_GUAJI = 0x28A470          # 模块内: 挂机/自动对象指针
+    ITEM_SLOT_OFF = 0xB11B4       # 挂机对象 + 此偏移 = 物品槽1 (实测稳定)
+    OFF_ITEM_REC = 0x14           # 物品对象 -> 记录
+
+    def _item_guaiji_obj(self):
+        """挂机/自动对象 = [exe+OFF_GUAJI]"""
+        try:
+            return self.read_u32(self.module_base + self.OFF_GUAJI) or 0
+        except Exception:
+            return 0
+
+    def _item_slot(self, k, off=None):
+        """第 k 个物品槽的绝对地址(0起). 用指针链, 重开游戏也不会失效
+
+        off=None -> 用当前生效的偏移(自动校正过的优先, 否则 profile 里的 ITEM_SLOT_OFF)
+        """
+        g = self._item_guaiji_obj()
+        if not g:
+            return 0
+        if off is None:
+            off = getattr(self, "_item_auto_off", 0) or self.ITEM_SLOT_OFF
+        return g + off + k * 4
+
+    def _read_item_slots(self, off):
+        """用指定偏移读 3 个槽 -> {物品对象: (名字, x, y)}"""
+        out = {}
+        for k in range(3):
+            try:
+                pobj = self.read_u32(self._item_slot(k, off))
+            except Exception:
+                continue
+            if not pobj or pobj < 0x10000 or pobj in out:
+                continue
+            info = self._item_obj_info(pobj)
+            if info:
+                out[pobj] = info
+        return out
+
+    def _probe_item_slot_off(self, g):
+        """槽表偏移跟客户端版本有关(旧 0xB11B4 / 本客户端 0xB11F4), 换台机器/换版本就不对.
+
+        做法: 在挂机对象里找"3 个连续、且都能解析成物品对象"的指针。
+        实测本客户端全对象里只有 1 处命中 -> 无歧义, 开销 1MB 左右的一次块读。
+        """
+        try:
+            lo = int(g)
+            hi = int(g) + self.ITEM_SLOT_SEARCH_SPAN
+        except Exception:
+            return 0
+        for rbase, rstop in ff_iter_regions(self.pm, lo, hi):
+            a = (int(rbase) + 3) & ~3
+            while a < rstop:
+                n = min(0x10000, rstop - a)
+                try:
+                    buf = self.pm.read_bytes(a, n)
+                except Exception:
+                    a += n
+                    continue
+                for off in range(0, max(0, n - 0x18), 4):
+                    v1 = struct.unpack_from("<I", buf, off)[0]
+                    if v1 < 0x10000:
+                        continue
+                    v2 = struct.unpack_from("<I", buf, off + 4)[0]
+                    if v2 < 0x10000:
+                        continue
+                    v3 = struct.unpack_from("<I", buf, off + 8)[0]
+                    if v3 < 0x10000:
+                        continue
+                    if (self._item_obj_info(v1) and self._item_obj_info(v2)
+                            and self._item_obj_info(v3)):
+                        return (a + off) - int(g)
+                a += n
+        return 0
+
+    OFF_ITEM_REC = 0x14          # 物品对象 -> 记录
+
+    ITEM_OBJ_REC_OFF = 0x14         # 物品对象 +0x14 -> 物品记录
+    ITEM_REC_NAME_OFF = 0x10        # 物品记录 +0x10 -> 名字指针
+    ITEM_POOL_SPAN = 0x10000        # 以已知物品对象为锚点, 前后各扫这么多字节
+    ITEM_SLOT_SEARCH_SPAN = 0x200000   # 槽表偏移自动校正时, 从挂机对象起搜这么长的一段
+
+    def _item_obj_info(self, obj):
+        """物品对象 -> (名字, x, y); 结构不对返回 None
+
+        物品对象结构(2026-10-08 实测):
+          +0x14 -> rec;  rec+0x00 = X, rec+0x04 = Y, rec+0x10 = 名字指针(GBK)
+        """
+        try:
+            rec = self.read_u32(obj + self.ITEM_OBJ_REC_OFF)
+            if not rec or rec < 0x10000 or rec > 0x7FFFFFFF:
+                return None
+            x = self.read_i32(rec)
+            y = self.read_i32(rec + 4)
+            if not (0 < x < 10000 and 0 < y < 10000):
+                return None
+            nptr = self.read_u32(rec + self.ITEM_REC_NAME_OFF)
+            if not nptr or nptr < 0x10000 or nptr > 0x7FFFFFFF:
+                return None
+            # 名字是 Delphi AnsiString: 长度前缀在 nptr-4(1..48 字节), 内容 GBK 且不含 0
+            # (只判"能读出非空字符串"会被伪记录骗到 -> 物品列表里多出垃圾行)
+            try:
+                ln = self.read_u32(nptr - 4)
+                raw = self.pm.read_bytes(nptr, ln) if 1 <= ln <= 48 else b""
+            except Exception:
+                return None
+            if not raw or len(raw) != ln or b"\x00" in raw:
+                return None
+            nm = self.read_cstring(nptr, ln)
+            if not nm:
+                return None
+            return nm, x, y
+        except Exception:
+            return None
+
+    def _scan_item_pool(self, anchor, span=None):
+        """以 anchor(已知物品对象) 为中心, 扫周围的"物品对象池"
+
+        客户端那个槽表只有 3 个位置(挂机对象 + ITEM_SLOT_OFF, 偏移随版本变),
+        地上超过 3 件就会漏;
+        物品对象本身都放在同一个堆池里(实测 7 个对象挤在 0x2400 字节内),
+        所以整块读进来在内存里筛, 只对候选做指针校验, 开销很小。
+        """
+        found = {}
+        if not anchor:
+            return found
+        if span is None:
+            span = self.ITEM_POOL_SPAN
+        try:
+            lo = max(0x00010000, int(anchor) - span)
+            hi = min(0x7FFF0000, int(anchor) + span)
+        except Exception:
+            return found
+        for rbase, rstop in ff_iter_regions(self.pm, lo, hi):
+            a = (rbase + 3) & ~3
+            while a < rstop:
+                n = min(0x10000, rstop - a)
+                try:
+                    buf = self.pm.read_bytes(a, n)
+                except Exception:
+                    a += n
+                    continue
+                step = 4
+                for off in range(0, max(0, n - 0x18), step):
+                    rec = struct.unpack_from("<I", buf, off + self.ITEM_OBJ_REC_OFF)[0]
+                    if not (0x10000 < rec < 0x7FFFFFFF):
+                        continue
+                    obj = a + off
+                    info = self._item_obj_info(obj)
+                    if info:
+                        found[obj] = info
+                a += n
+        return found
+
+    def get_items(self, px=None, py=None, force=False):
+        """地上物品: 槽表(3个) + 物品池扫描 -> 去重 -> [(距离, 名称, x, y, 对象地址)]"""
+        if px is None or py is None:
+            px, py = self.get_player_pos()
+        key = (px, py)
+        if not force:
+            now = time.time()
+            data = self._items_cache_data
+            if (data is not None and self._items_cache_key == key
+                    and (now - self._items_cache_at) < ITEM_CACHE_SEC):
+                return data
+        with self._items_cache_lock:
+            if not force:
+                now = time.time()
+                data = self._items_cache_data
+                if (data is not None and self._items_cache_key == key
+                        and (now - self._items_cache_at) < ITEM_CACHE_SEC):
+                    return data
+            data = self._scan_timed("items", lambda: self._get_items_impl(px, py))
+            self._items_cache_data = data
+            self._items_cache_at = time.time()
+            self._items_cache_key = key
+            return data
+
+    def _get_items_impl(self, px=None, py=None):
+        out = {}
+        anchor = 0
+        g = self._item_guaiji_obj()
+        # 换地图/重开游戏会换挂机对象 -> 自动校正结果作废, 重新探一次
+        if g != getattr(self, "_item_g_seen", None):
+            self._item_g_seen = g
+            self._item_auto_off = 0
+            self._item_probe_at = 0.0
+            self._item_empty_logged = False
+        offs = []
+        _auto = getattr(self, "_item_auto_off", 0)
+        if _auto:
+            offs.append(_auto)
+        if self.ITEM_SLOT_OFF and self.ITEM_SLOT_OFF not in offs:
+            offs.append(self.ITEM_SLOT_OFF)
+        for off in offs:
+            out = self._read_item_slots(off)
+            if out:
+                break
+        # 两个偏移都读不到 -> 在挂机对象里自己找槽表(最多 10 秒探一次, 免得地上暂时没东西就再也不探)
+        _now = time.time()
+        if not out and g and (_now - getattr(self, "_item_probe_at", 0.0)) >= 10.0:
+            self._item_probe_at = _now
+            try:
+                _found = self._probe_item_slot_off(g)
+            except Exception:
+                _found = 0
+            if _found:
+                out = self._read_item_slots(_found)
+                if out:
+                    self._item_auto_off = _found
+                    app_log("[物品] 槽表偏移自动校正: +0x%X (配置里是 +0x%X)"
+                            % (_found, self.ITEM_SLOT_OFF))
+        if not out and not getattr(self, "_item_empty_logged", False):
+            self._item_empty_logged = True
+            app_log("[物品] 地上没读到物品: 挂机对象=[exe+0x%X]=0x%08X  配置偏移=+0x%X"
+                    % (self.OFF_GUAJI, g, self.ITEM_SLOT_OFF))
+        if out:
+            anchor = next(iter(out))
+        # 槽表最多 3 件 -> 用已知物品对象当锚点, 把同一物品池里的都扫出来
+        if not anchor:
+            anchor = getattr(self, "_item_anchor", 0)
+        if anchor:
+            try:
+                for obj, info in self._scan_item_pool(anchor).items():
+                    out.setdefault(obj, info)
+            except Exception:
+                pass
+        if out:
+            self._item_anchor = next(iter(out))
+        if px is None or py is None:
+            try:
+                px, py = self.get_player_pos()
+            except Exception:
+                px = py = 0
+        rows = []
+        for pobj, (nm, x, y) in out.items():
+            rows.append((max(abs(x - px), abs(y - py)), nm, x, y, pobj))
+        rows.sort()
+        return rows
+
+
+    # ---------- 自动寻路（新客户端走主线程纯移动，其他客户端兜底 SetTarget）----------
+    def get_move_obj(self):
+        """自动移动控制对象 = [[exe+0x2BA8FC]]"""
+        try:
+            p1 = self.read_u32(self.module_base + OFF_MOVE_OBJ_PTR)
+            if not p1:
+                return 0
+            return self.read_u32(p1)
+        except Exception:
+            return 0
+
+    # ---------- 移动: 常驻线程(只注入一次) + 一次性注入(兜底) ----------
+    def _start_remote_thread(self, addr):
+        """起一个远程线程, 返回句柄(不关不等, 由调用方管理)。0 = 失败"""
+        try:
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.CreateRemoteThread.restype = ctypes.wintypes.HANDLE
+            k32.CreateRemoteThread.argtypes = [
+                ctypes.wintypes.HANDLE, ctypes.c_void_p, ctypes.c_size_t,
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.wintypes.DWORD,
+                ctypes.POINTER(ctypes.wintypes.DWORD)]
+            h = k32.CreateRemoteThread(self.pm.process_handle, None, 0,
+                                       ctypes.c_void_p(addr), None, 0, None)
+            return int(h) if h else 0
+        except Exception:
+            return 0
+
+    def _rt_is_wow64(self):
+        """目标是不是 32 位进程(我们是 64 位, 所以 IsWow64Process 可靠)"""
+        try:
+            import ctypes.wintypes as wt
+            v = wt.BOOL(0)
+            ctypes.windll.kernel32.IsWow64Process(
+                ctypes.wintypes.HANDLE(self.pm.process_handle),
+                ctypes.byref(v))
+            return bool(v.value)
+        except Exception:
+            return False
+
+    def _rt_kernel32_base(self):
+        """目标进程 kernel32 基址(PEB -> Ldr -> InMemoryOrderModuleList)。
+        注意: WOW64 进程要用 ProcessWow64Information 拿 32 位 PEB,
+        ProcessBasicInformation 给的是 64 位 PEB。"""
+        if getattr(self, "_k32_base", 0):
+            return self._k32_base
+        try:
+            import ctypes.wintypes as wt
+            ntdll = ctypes.WinDLL("ntdll")
+
+            class PBI(ctypes.Structure):
+                _fields_ = [("Reserved1", ctypes.c_void_p),
+                            ("PebBaseAddress", ctypes.c_void_p),
+                            ("Reserved2", ctypes.c_void_p * 2),
+                            ("UniqueProcessId", ctypes.c_void_p),
+                            ("Reserved3", ctypes.c_void_p)]
+
+            ntdll.NtQueryInformationProcess.restype = ctypes.c_long
+            ntdll.NtQueryInformationProcess.argtypes = [
+                wt.HANDLE, wt.DWORD, ctypes.c_void_p, wt.ULONG,
+                ctypes.POINTER(wt.ULONG)]
+            pbi = PBI()
+            got = wt.ULONG(0)
+            st = ntdll.NtQueryInformationProcess(
+                self.pm.process_handle, 0, ctypes.byref(pbi),
+                ctypes.sizeof(pbi), ctypes.byref(got))
+            if st != 0:
+                return 0
+            if self._rt_is_wow64():                  # 目标 32 位
+                wow = ctypes.c_ulonglong(0)
+                st2 = ntdll.NtQueryInformationProcess(
+                    self.pm.process_handle, 26, ctypes.byref(wow),
+                    ctypes.sizeof(wow), ctypes.byref(got))
+                if st2 != 0 or not wow.value:
+                    return 0
+                pbase = wow.value                    # 32 位 PEB
+                off_ldr, off_head = 0x0C, 0x14
+                off_dll, off_nlen, off_nbuf = 0x10, 0x24, 0x28
+                rd = lambda x: self.read_u32(x)
+            else:                                    # 目标 64 位
+                if not pbi.PebBaseAddress:
+                    return 0
+                pbase = int(pbi.PebBaseAddress)
+                off_ldr, off_head = 0x18, 0x20
+                off_dll, off_nlen, off_nbuf = 0x20, 0x48, 0x50
+                rd = lambda x: self.pm.read_ulonglong(x)
+            ldr = rd(pbase + off_ldr)
+            if not ldr:
+                return 0
+            head = ldr + off_head
+            cur = rd(head)
+            for _ in range(80):
+                if not cur or cur == head:
+                    break
+                dll = rd(cur + off_dll)
+                nlen = self.read_u16(cur + off_nlen)
+                nbuf = rd(cur + off_nbuf)
+                if dll and nbuf and 0 < nlen <= 64:
+                    nm = self.pm.read_bytes(nbuf, nlen).decode("utf-16-le", "ignore")
+                    if nm.lower().startswith("kernel32"):
+                        self._k32_base = dll
+                        return dll
+                cur = rd(cur)                        # Flink
+        except Exception:
+            pass
+        return 0
+
+    def _rt_export(self, base, fname):
+        """自己解析目标模块的导出表(不依赖本机 DLL 版本/位数)"""
+        try:
+            if self.pm.read_bytes(base, 2) != b"MZ":
+                return 0
+            nt = base + self.read_u32(base + 0x3C)
+            if self.pm.read_bytes(nt, 4) != b"PE\x00\x00":
+                return 0
+            machine = self.read_u16(nt + 4)
+            opt = nt + 0x18
+            dd = 0x60 if machine == 0x14C else 0x70          # PE32 / PE32+
+            exp = base + self.read_u32(opt + dd)
+            n_names = self.read_u32(exp + 0x18)
+            a_funcs = self.read_u32(exp + 0x1C)
+            a_names = self.read_u32(exp + 0x20)
+            a_ords = self.read_u32(exp + 0x24)
+            if not (0 < n_names < 20000 and a_funcs and a_names and a_ords):
+                return 0
+            want = fname.encode() + b"\x00"
+            for i in range(n_names):
+                nrva = self.read_u32(base + a_names + i * 4)
+                if not nrva:
+                    continue
+                if self.pm.read_bytes(base + nrva, len(want)) == want:
+                    o = self.read_u16(base + a_ords + i * 2)
+                    frva = self.read_u32(base + a_funcs + o * 4)
+                    if frva:
+                        return base + frva
+        except Exception:
+            pass
+        return 0
+
+    def _rt_user32_export(self, fname):
+        try:
+            mod = pymem.process.module_from_name(self.pm.process_handle, "user32.dll")
+            if not mod:
+                return 0
+            return self._rt_export(int(mod.lpBaseOfDll), fname)
+        except Exception:
+            return 0
+
+    def _game_window_responsive(self, hwnd):
+        try:
+            result = ctypes.c_size_t(0)
+            flags = 0x00000002 | 0x00000001
+            rc = ctypes.windll.user32.SendMessageTimeoutW(
+                hwnd, 0, 0, 0, flags, 120, ctypes.byref(result))
+            return bool(rc)
+        except Exception:
+            return True
+
+    def _run_remote_stub(self, addr, timeout=2000):
+        h = self._start_remote_thread(addr)
+        if not h:
+            return None
+        try:
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.WaitForSingleObject.restype = ctypes.wintypes.DWORD
+            k32.WaitForSingleObject.argtypes = [ctypes.wintypes.HANDLE,
+                                                ctypes.wintypes.DWORD]
+            k32.GetExitCodeThread.restype = ctypes.wintypes.BOOL
+            k32.GetExitCodeThread.argtypes = [ctypes.wintypes.HANDLE,
+                                              ctypes.POINTER(ctypes.wintypes.DWORD)]
+            rc = k32.WaitForSingleObject(ctypes.wintypes.HANDLE(h), int(timeout))
+            code = ctypes.wintypes.DWORD(0)
+            if rc != 0:
+                return None
+            if not k32.GetExitCodeThread(ctypes.wintypes.HANDLE(h), ctypes.byref(code)):
+                return None
+            return int(code.value)
+        finally:
+            try:
+                ctypes.WinDLL("kernel32").CloseHandle(ctypes.wintypes.HANDLE(h))
+            except Exception:
+                pass
+
+    @staticmethod
+    def _build_pure_move_callback(blk, code_addr, base, get_tid=0):
+        import struct
+        b = bytearray()
+        fixes = []
+        labels = {}
+
+        def u32(v):
+            b.extend(struct.pack("<I", int(v) & 0xFFFFFFFF))
+
+        def label(name):
+            labels[name] = len(b)
+
+        def jump(name, cc=None):
+            if cc is None:
+                b.append(0xE9)
+            else:
+                b.extend(b"\x0F" + bytes((cc,)))
+            fixes.append((len(b), name))
+            b.extend(b"\x00\x00\x00\x00")
+
+        def call(target):
+            b.append(0xE8)
+            b.extend(struct.pack("<i", int(target) - (int(code_addr) + len(b) + 4)))
+
+        def mov_eax_abs(addr):
+            b.append(0xA1)
+            u32(addr)
+
+        def mov_abs_eax(addr):
+            b.append(0xA3)
+            u32(addr)
+
+        def inc_abs(addr):
+            b.extend(b"\xFF\x05")
+            u32(addr)
+
+        def mov_abs_imm(addr, value):
+            b.extend(b"\xC7\x05")
+            u32(addr)
+            u32(value)
+
+        def cmp_eax(value):
+            b.extend(b"\x83\xF8" + bytes((value & 0xFF,)))
+
+        def test_eax():
+            b.extend(b"\x85\xC0")
+
+        def test_edx():
+            b.extend(b"\x85\xD2")
+
+        def mov_edx_abs(addr):
+            b.extend(b"\x8B\x15")
+            u32(addr)
+
+        def mov_ecx_abs(addr):
+            b.extend(b"\x8B\x0D")
+            u32(addr)
+
+        start_func = base + START_MOVE_FUNC
+        move_ptr = base + OFF_MOVE_OBJ_PTR
+        player_ptr = base + OFF_PLAYER
+        stop_a = base + MOVE_STOP_GLOBAL_A_OFF
+        stop_b = base + MOVE_STOP_GLOBAL_B_OFF
+        cmd_addr = blk
+        x_addr = blk + 4
+        y_addr = blk + 8
+        seq_addr = blk + 12
+        ack_addr = blk + 16
+        result_addr = blk + 20
+        attempts_addr = blk + 24
+        zero_addr = blk + 28
+        count_addr = blk + 32
+        tid_addr = blk + 36
+
+        b.append(0x60)
+        inc_abs(count_addr)
+        if get_tid:
+            call(get_tid)
+            mov_abs_eax(tid_addr)
+        mov_eax_abs(cmd_addr)
+        cmp_eax(MOVE_CMD_MOVE)
+        jump("move", 0x84)
+        cmp_eax(MOVE_CMD_STOP)
+        jump("stop", 0x84)
+        jump("exit")
+
+        label("move")
+        mov_edx_abs(x_addr)
+        mov_ecx_abs(y_addr)
+        mov_eax_abs(move_ptr)
+        test_eax()
+        jump("move_fail", 0x84)
+        b.extend(b"\x8B\x00")
+        test_eax()
+        jump("move_fail", 0x84)
+        b.extend(b"\x8B\x98")
+        u32(MOVE_STATE_OBJ_OFF)
+        b.extend(b"\x85\xDB")
+        jump("move_fail", 0x84)
+        b.extend(b"\x80\xBB")
+        u32(MOVE_ACTIVE_FLAG_OFF)
+        b.append(0x00)
+        jump("move_busy", 0x85)
+        b.extend(b"\x89\x90")
+        u32(MOVE_OBJ_X)
+        b.extend(b"\x89\x88")
+        u32(MOVE_OBJ_Y)
+        b.extend(b"\x8B\xC3")
+        b.extend(b"\xB2\x01")
+        call(start_func)
+        mov_eax_abs(seq_addr)
+        mov_abs_eax(ack_addr)
+        mov_abs_imm(result_addr, 1)
+        mov_abs_imm(cmd_addr, MOVE_CMD_IDLE)
+        jump("exit")
+
+        label("move_busy")
+        mov_eax_abs(seq_addr)
+        mov_abs_eax(ack_addr)
+        mov_abs_imm(result_addr, 2)
+        mov_abs_imm(cmd_addr, MOVE_CMD_IDLE)
+        jump("exit")
+
+        label("move_fail")
+        mov_eax_abs(seq_addr)
+        mov_abs_eax(ack_addr)
+        mov_abs_imm(result_addr, 0xFFFFFFFF)
+        mov_abs_imm(cmd_addr, MOVE_CMD_IDLE)
+        jump("exit")
+
+        label("stop")
+        mov_abs_imm(result_addr, 0)
+        inc_abs(attempts_addr)
+        mov_eax_abs(move_ptr)
+        test_eax()
+        jump("stop_player", 0x84)
+        b.extend(b"\x8B\x00")
+        test_eax()
+        jump("stop_player", 0x84)
+        b.extend(b"\x8B\x90")
+        u32(MOVE_SUB_STATE_OFF)
+        test_edx()
+        jump("stop_fields", 0x84)
+        b.extend(b"\x8B\xDA")
+        b.extend(b"\x8B\xC3")
+        b.extend(b"\x31\xD2")
+        call(start_func)
+
+        label("stop_fields")
+        mov_eax_abs(move_ptr)
+        test_eax()
+        jump("stop_player", 0x84)
+        b.extend(b"\x8B\x00")
+        test_eax()
+        jump("stop_player", 0x84)
+        b.extend(b"\xC7\x40")
+        b.append(MOVE_CLEAR_78_OFF & 0xFF)
+        u32(0)
+        b.extend(b"\xC7\x80")
+        u32(MOVE_CLEAR_E4_OFF)
+        u32(0xFFFFFFFF)
+
+        label("stop_player")
+        mov_eax_abs(player_ptr)
+        test_eax()
+        jump("stop_check", 0x84)
+        b.extend(b"\xC7\x40")
+        b.append(MOVE_PLAYER_SUB_OFF & 0xFF)
+        u32(0)
+        b.extend(b"\xC7\x40")
+        b.append(MOVE_PLAYER_STATE_OFF & 0xFF)
+        u32(0)
+
+        label("stop_check")
+        mov_eax_abs(stop_a)
+        test_eax()
+        jump("stop_check_b", 0x84)
+        b.extend(b"\xC6\x00\x00")
+
+        label("stop_check_b")
+        mov_eax_abs(stop_b)
+        test_eax()
+        jump("stop_stable", 0x84)
+        b.extend(b"\xC6\x00\x00")
+
+        label("stop_stable")
+        mov_eax_abs(move_ptr)
+        test_eax()
+        jump("stop_not_stable", 0x84)
+        b.extend(b"\x8B\x00")
+        test_eax()
+        jump("stop_not_stable", 0x84)
+        b.extend(b"\x8B\x90")
+        u32(MOVE_SUB_STATE_OFF)
+        test_edx()
+        jump("stop_sub_zero", 0x84)
+        b.extend(b"\x8B\x92")
+        u32(MOVE_ACTIVE_FLAG_OFF)
+        jump("stop_sub_checked")
+
+        label("stop_sub_zero")
+        b.extend(b"\x31\xD2")
+
+        label("stop_sub_checked")
+        mov_eax_abs(player_ptr)
+        test_eax()
+        jump("stop_not_stable", 0x84)
+        b.extend(b"\x8B\x88")
+        u32(MOVE_PLAYER_SUB_OFF)
+        b.extend(b"\x09\xCA")
+        b.extend(b"\x8B\x88")
+        u32(MOVE_PLAYER_STATE_OFF)
+        b.extend(b"\x09\xCA")
+        jump("stop_not_stable", 0x85)
+        inc_abs(zero_addr)
+        mov_eax_abs(zero_addr)
+        cmp_eax(MOVE_STOP_ZERO_CYCLES)
+        jump("stop_done", 0x83)
+        jump("stop_max")
+
+        label("stop_not_stable")
+        mov_abs_imm(zero_addr, 0)
+
+        label("stop_max")
+        mov_eax_abs(attempts_addr)
+        cmp_eax(MOVE_STOP_MAX_CYCLES)
+        jump("exit", 0x82)
+
+        label("stop_done")
+        mov_abs_imm(cmd_addr, MOVE_CMD_IDLE)
+        mov_abs_imm(result_addr, 1)
+        mov_eax_abs(seq_addr)
+        mov_abs_eax(ack_addr)
+        jump("exit")
+
+        label("exit")
+        b.append(0x61)
+        b.extend(b"\xC2\x10\x00")
+        for pos, name in fixes:
+            b[pos:pos + 4] = struct.pack("<i", labels[name] - (pos + 4))
+        return bytes(b)
+
+    @staticmethod
+    def _build_timer_setup_stub_at(stub_addr, callback, interval, timer_id, hwnd, set_timer):
+        import struct
+        b = bytearray(b"\x68")
+        b.extend(struct.pack("<I", int(callback) & 0xFFFFFFFF))
+        b.append(0x68)
+        b.extend(struct.pack("<I", int(interval) & 0xFFFFFFFF))
+        b.append(0x68)
+        b.extend(struct.pack("<I", int(timer_id) & 0xFFFFFFFF))
+        b.append(0x68)
+        b.extend(struct.pack("<I", int(hwnd) & 0xFFFFFFFF))
+        b.append(0xE8)
+        b.extend(struct.pack("<i", int(set_timer) - (int(stub_addr) + len(b) + 4)))
+        b.append(0xC3)
+        return bytes(b)
+
+    @staticmethod
+    def _build_timer_kill_stub(stub_addr, timer_id, hwnd, kill_timer):
+        import struct
+        b = bytearray(b"\x68")
+        b.extend(struct.pack("<I", int(timer_id) & 0xFFFFFFFF))
+        b.append(0x68)
+        b.extend(struct.pack("<I", int(hwnd) & 0xFFFFFFFF))
+        b.append(0xE8)
+        b.extend(struct.pack("<i", int(kill_timer) - (int(stub_addr) + len(b) + 4)))
+        b.append(0xC3)
+        return bytes(b)
+
+    def _ensure_move_timer(self):
+        if not START_MOVE_FUNC or not self.pm or not self.module_base:
+            return False
+        with self._move_cmd_lock:
+            hwnd = self.find_window()
+            if not hwnd:
+                return False
+            if (self._move_timer_id and self._move_timer_hwnd == hwnd
+                    and self._pure_move_blk and self._pure_move_callback):
+                try:
+                    if ctypes.windll.user32.IsWindow(hwnd):
+                        return True
+                except Exception:
+                    pass
+            self._destroy_move_timer()
+            if not self._rt_is_wow64():
+                return False
+            set_timer = self._rt_user32_export("SetTimer")
+            if not set_timer:
+                return False
+            try:
+                blk = self.pm.allocate(64)
+                callback = self.pm.allocate(1024)
+                setup = self.pm.allocate(128)
+                self.pm.write_bytes(blk, b"\x00" * 64, 64)
+                cb = self._build_pure_move_callback(blk, callback, self.module_base)
+                self.pm.write_bytes(callback, cb, len(cb))
+                tid = random.randint(0x6000, 0x7FFF)
+                stub = self._build_timer_setup_stub_at(
+                    setup, callback, MOVE_TIMER_INTERVAL_MS, tid, hwnd, set_timer)
+                self.pm.write_bytes(setup, stub, len(stub))
+                got = self._run_remote_stub(setup)
+                if not got:
+                    return False
+                self._pure_move_blk = blk
+                self._pure_move_callback = callback
+                self._pure_move_setup = setup
+                self._move_timer_id = tid
+                self._move_timer_hwnd = hwnd
+                self._move_cmd_seq = 0
+                app_log("MOVE: 主线程定时器已绑定 hwnd=0x%X timer=0x%X callback=0x%X"
+                        % (hwnd, tid, callback))
+                return True
+            except Exception as exc:
+                app_log("MOVE: 主线程定时器绑定失败 %s" % exc)
+                return False
+
+    def _send_pure_move_cmd(self, x, y):
+        with self._move_cmd_lock:
+            if not self._ensure_move_timer():
+                return False
+            if not self._game_window_responsive(self._move_timer_hwnd):
+                return False
+            blk = self._pure_move_blk
+            target = (int(x), int(y))
+            now = time.time()
+            if (self._last_move_cmd_target == target
+                    and now - self._last_move_cmd_at < MOVE_CMD_MIN_INTERVAL_SEC):
+                return True
+            try:
+                if self.read_u32(blk) != MOVE_CMD_IDLE:
+                    return False
+                seq = self._move_cmd_seq + 1
+                self._move_cmd_seq = seq
+                self.pm.write_uint(blk + 4, int(x) & 0xFFFFFFFF)
+                self.pm.write_uint(blk + 8, int(y) & 0xFFFFFFFF)
+                self.pm.write_uint(blk + 12, seq)
+                self.pm.write_uint(blk + 20, 0)
+                self.pm.write_uint(blk, MOVE_CMD_MOVE)
+                deadline = time.time() + 0.35
+                while time.time() < deadline:
+                    if self.read_u32(blk + 16) == seq:
+                        ok = self.read_u32(blk + 20) == 1
+                        if ok:
+                            self._last_move_cmd_at = time.time()
+                            self._last_move_cmd_target = target
+                        return ok
+                    time.sleep(0.005)
+                return False
+            except Exception:
+                return False
+
+    def _send_pure_stop_cmd(self):
+        with self._move_cmd_lock:
+            if not self._ensure_move_timer():
+                return False
+            if not self._game_window_responsive(self._move_timer_hwnd):
+                return False
+            blk = self._pure_move_blk
+            try:
+                seq = self._move_cmd_seq + 1
+                self._move_cmd_seq = seq
+                self.pm.write_uint(blk + 24, 0)
+                self.pm.write_uint(blk + 28, 0)
+                self.pm.write_uint(blk + 20, 0)
+                self.pm.write_uint(blk + 12, seq)
+                self.pm.write_uint(blk, MOVE_CMD_STOP)
+                deadline = time.time() + 2.5
+                while time.time() < deadline:
+                    if self.read_u32(blk + 16) == seq:
+                        return self.read_u32(blk + 20) == 1
+                    time.sleep(0.01)
+                return False
+            except Exception:
+                return False
+
+    def close_move_timer(self):
+        self._destroy_move_timer()
+
+    def _destroy_move_timer(self):
+        lock = getattr(self, "_move_cmd_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+        with lock:
+            tid = getattr(self, "_move_timer_id", 0)
+            hwnd = getattr(self, "_move_timer_hwnd", 0)
+            setup = getattr(self, "_pure_move_setup", 0)
+            pm = getattr(self, "pm", None)
+            if pm is not None and tid and hwnd and setup:
+                try:
+                    kill_timer = self._rt_user32_export("KillTimer")
+                    if kill_timer:
+                        stub = self._build_timer_kill_stub(setup, tid, hwnd, kill_timer)
+                        pm.write_bytes(setup, stub, len(stub))
+                        self._run_remote_stub(setup, timeout=1000)
+                except Exception:
+                    pass
+            self._move_timer_id = 0
+            self._move_timer_hwnd = 0
+            self._last_move_cmd_at = 0.0
+            self._last_move_cmd_target = None
+            self._pure_move_blk = 0
+            self._pure_move_callback = 0
+            self._pure_move_setup = 0
+
+    def _rt_sleep_addr(self):
+        """目标进程里的 kernel32!Sleep 地址"""
+        if getattr(self, "_sleep_addr", 0):
+            return self._sleep_addr
+        kb = self._rt_kernel32_base()
+        if not kb:
+            return 0
+        a = self._rt_export(kb, "Sleep")
+        if a:
+            self._sleep_addr = a
+        return a
+
+    def _move_thread_alive(self):
+        h = getattr(self, "_move_thread", 0)
+        if not h:
+            return False
+        try:
+            k32 = ctypes.WinDLL("kernel32")
+            k32.WaitForSingleObject.restype = ctypes.wintypes.DWORD
+            k32.WaitForSingleObject.argtypes = [ctypes.wintypes.HANDLE,
+                                                ctypes.wintypes.DWORD]
+            return k32.WaitForSingleObject(
+                ctypes.wintypes.HANDLE(h), 0) == 0x102       # WAIT_TIMEOUT = 还活着
+        except Exception:
+            return False
+
+    @staticmethod
+    def _build_move_stub(blk, code_addr, func, sleep):
+        """生成常驻线程机器码(纯函数, 方便单测)
+        命令块: [0]=flag [4]=obj [8]=x [12]=y
+        """
+        import struct
+        c = bytearray()
+
+        def e8(target):
+            c.extend(b"\xE8" + struct.pack(
+                "<i", target - (code_addr + len(c) + 5)))
+
+        c.extend(b"\xBB" + struct.pack("<I", blk))      # mov ebx, blk
+        c.extend(b"\x83\x3B\x00")                     # cmp dword [ebx], 0
+        c.extend(b"\x74\x16")                          # je  +22 (去等)
+        c.extend(b"\x8B\x43\x04")                     # mov eax, [ebx+4]
+        c.extend(b"\x8B\x53\x08")                     # mov edx, [ebx+8]
+        c.extend(b"\x8B\x4B\x0C")                     # mov ecx, [ebx+12]
+        c.extend(b"\xC7\x03\x00\x00\x00\x00")      # mov dword [ebx], 0
+        c.extend(b"\x60")                               # pushad
+        e8(func)                                         # call SetTarget
+        c.extend(b"\x61")                               # popad
+        c.extend(b"\x6A\x14")                          # push 20 (ms)
+        e8(sleep)                                        # call Sleep
+        c.extend(b"\xE9" + struct.pack(
+            "<i", code_addr - (code_addr + len(c) + 5)))         # jmp 开头
+        return bytes(c)
+
+    def _ensure_move_thread(self):
+        """注入"常驻移动线程": 只此一次, 之后靠命令块驱动, 不再新建线程"""
+        if getattr(self, "_move_blk", 0) and self._move_thread_alive():
+            return True
+        sleep = self._rt_sleep_addr()
+        if not sleep:
+            return False
+        func = self.module_base + OFF_MOVE_FUNC
+        if not getattr(self, "_move_blk", 0):
+            self._move_blk = self.pm.allocate(256)
+        blk = self._move_blk
+        code_addr = blk + 16
+        code = self._build_move_stub(blk, code_addr, func, sleep)
+        self.pm.write_bytes(blk, b"\x00" * 16, 16)
+        self.pm.write_bytes(code_addr, code, len(code))
+        h = self._start_remote_thread(code_addr)
+        if not h:
+            return False
+        self._move_thread = h
+        app_log("MOVE: 常驻线程装入 @0x%X (Sleep=0x%X, %d 字节)"
+                % (code_addr, sleep, len(code)))
+        return True
+
+    def _send_move_cmd(self, x, y):
+        """把目标写进命令块; 常驻线程 20ms 内执行"""
+        try:
+            if not self._ensure_move_thread():
+                return False
+            obj = self.get_move_obj()
+            if not obj:
+                return False
+            blk = self._move_blk
+            self.pm.write_uint(blk + 4, obj)
+            self.pm.write_uint(blk + 8, int(x) & 0xFFFFFFFF)
+            self.pm.write_uint(blk + 12, int(y) & 0xFFFFFFFF)
+            self.pm.write_uint(blk, 1)
+            return True
+        except Exception:
+            return False
+
+    def _create_remote_thread(self, addr):
+        """兜底: 一次性注入调用(常驻线程不可用时才用), 带限速 + 卡住检测。
+        注入一次 SetTarget 就会在游戏里新开一个线程; 卡住不返回的话线程只增不减
+        (实测约 1.8 个/秒) -> 几分钟后游戏窗口消失/卡死。"""
+        if getattr(self, "_rt_disabled", False):
+            return False
+        now = time.time()
+        if now - getattr(self, "_rt_last", 0.0) < 0.4:       # 最快 0.4 秒一次
+            return False
+        self._rt_last = now
+        h = self._start_remote_thread(addr)
+        if not h:
+            return False
+        rc = 0x102
+        try:
+            k32 = ctypes.WinDLL("kernel32")
+            k32.WaitForSingleObject.restype = ctypes.wintypes.DWORD
+            k32.WaitForSingleObject.argtypes = [ctypes.wintypes.HANDLE,
+                                                ctypes.wintypes.DWORD]
+            k32.CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
+            rc = k32.WaitForSingleObject(ctypes.wintypes.HANDLE(h), 1500)
+            k32.CloseHandle(ctypes.wintypes.HANDLE(h))
+        except Exception:
+            return False
+        self._rt_count = getattr(self, "_rt_count", 0) + 1
+        if rc == 0x102:                                      # WAIT_TIMEOUT = 卡住
+            self._rt_stuck = getattr(self, "_rt_stuck", 0) + 1
+            app_log("MOVE: 一次性注入卡住 %d 次 (共 %d 个)"
+                    % (self._rt_stuck, self._rt_count))
+            if self._rt_stuck >= 3:
+                self._rt_disabled = True
+                app_log("MOVE: 连续卡住 -> 停用一次性注入(保护游戏)")
+            return False
+        self._rt_stuck = 0
+        return True
+
+    def move_to_call(self, x, y):
+        """移动: 优先常驻线程(不会累积线程), 不行才退回一次性注入"""
+        if self._send_move_cmd(x, y):
+            return True
+        import struct
+        obj = self.get_move_obj()
+        if not obj:
+            return False
+        func = self.module_base + OFF_MOVE_FUNC
+        try:
+            if not getattr(self, "_stub_addr", 0):
+                self._stub_addr = self.pm.allocate(64)
+            stub = self._stub_addr
+            code = b"\xB8" + struct.pack("<I", obj)
+            code += b"\xBA" + struct.pack("<I", int(x) & 0xFFFFFFFF)
+            code += b"\xB9" + struct.pack("<I", int(y) & 0xFFFFFFFF)
+            rel = func - (stub + len(code) + 5)
+            code += b"\xE8" + struct.pack("<i", rel)
+            code += b"\xC3"
+            self.pm.write_bytes(stub, code, len(code))
+            return self._create_remote_thread(stub)
+        except Exception:
+            return False
+
+
+    def move_to_write(self, x, y):
+        """兜底: 纯内存写入（实测单独写不会驱动移动, 仅调用失败时兜底）"""
+        obj = self.get_move_obj()
+        if not obj:
+            return False
+        try:
+            self.pm.write_uint(obj + MOVE_OBJ_X, int(x) & 0xFFFFFFFF)
+            self.pm.write_uint(obj + MOVE_OBJ_Y, int(y) & 0xFFFFFFFF)
+            try:
+                sub = self.read_u32(obj + 0x64)
+                if sub and sub > 0x10000:
+                    self.pm.write_uchar(sub + 0x40, 1)
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
+
+    def move_to(self, x, y):
+        if START_MOVE_FUNC:
+            return self._send_pure_move_cmd(x, y)
+        if self.move_to_call(x, y):
+            return True
+        return self.move_to_write(x, y)
+
+    def stop_move(self):
+        if START_MOVE_FUNC:
+            return self._send_pure_stop_cmd()
+        try:
+            p = self.get_player()
+            if not p:
+                return False
+            x = self.read_i32(p + OFF_X)
+            y = self.read_i32(p + OFF_Y)
+            return self.move_to_call(x, y)
+        except Exception:
+            return False
+
+
+    def is_moving(self):
+        """人物是否真的在移动 —— 用坐标变化判断(比看目标字段可靠)"""
+        try:
+            p = self.get_player()
+            if not p:
+                return False
+            cur = (self.read_u32(p + OFF_X), self.read_u32(p + OFF_Y))
+            last = getattr(self, "_last_pos_chk", None)
+            self._last_pos_chk = cur
+            if last is None:
+                return False
+            return cur != last
+        except Exception:
+            return False
+class MiniBar(tk.Canvas):
+    """自绘小进度条: 条 + 居中的百分比文字
+
+    用 ttk.Progressbar 时, 百分比只能用 Label 盖在条上 -> 会有一块底色, 很难看。
+    这里直接画: 白色底 + 蓝色进度 + 中间文字(文字没有底色, 看着就是"透明")。
+    """
+
+    def __init__(self, parent, length=60, height=14, **kw):
+        tk.Canvas.__init__(self, parent, width=length, height=height,
+                           highlightthickness=0, bd=0, bg="#f0f0f0", **kw)
+        self._len = int(length)
+        self._h = int(height)
+        self._val = 0
+        self._max = 100
+        self._text = ""
+        self._redraw()
+
+    def set(self, value, maximum, text=""):
+        self._val = value
+        self._max = maximum
+        self._text = text or ""
+        self._redraw()
+
+
+    def _redraw(self):
+        try:
+            self.delete("all")
+            w, h = self._len, self._h
+            self.create_rectangle(0, 0, w - 1, h - 1, outline="#9A9A9A", fill="#FFFFFF")
+            f = 0.0
+            try:
+                if self._max:
+                    f = float(self._val) / float(self._max)
+            except Exception:
+                f = 0.0
+            f = max(0.0, min(1.0, f))
+            if f > 0.01:
+                self.create_rectangle(1, 1, max(1, int((w - 2) * f)) + 1, h - 1,
+                                      outline="", fill="#E03131")      # 红色
+            if self._text:
+                self.create_text(w / 2.0, h / 2.0, text=self._text,
+                                 font=("Microsoft YaHei", 8), fill="#1A1A1A")
+        except Exception:
+            pass
+class CheatApp:
+    def __init__(self, root, game):
+        self.root = root
+        self._stealth = bool(STEALTH_MODE)
+        self._stealth_hotkey_q = queue.Queue()
+        self.root.title(STEALTH_WINDOW_TITLE if self._stealth else "天昊助手")
+        # 初始尺寸先给个兜底, build_ui 结束时会按实际需求自动贴合一次
+        self.root.geometry("600x520")
+        self.root.option_add("*Font", ("Microsoft YaHei", 9))
+        # (已取消置顶: 去掉了 -topmost)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        self.game = game
+        self.guaji = False          # 总开关: 是否挂机中(未开不扫描)
+        self._guaji_arm = False     # 挂机启动倒计时中(还没真正开始)
+        self.auto_attack = False
+        self.attack_thread = None
+        self.skill_thread = None
+        self.pet_thread = None
+        self.auto_pickup = False
+        self.pick_thread = None
+        self._pick_paused_by_weight = False
+        self._pick_pause_reason = ""
+        self._pick_fail = {}
+        self._pick_wait_obj = 0
+        self._pick_wait_from = 0.0
+        self._pick_route_target = 0
+        self._pick_try_obj = 0
+        self._pick_try_since = 0.0
+        self._pick_try_pos = None
+        self._loot_pending = False
+        self._loot_from = 0.0
+        self._move_lock = threading.RLock()
+        self._move_state = MOVE_STATE_IDLE
+        self._move_owner = ""
+        self._move_prio = 0
+        self._move_until = 0.0
+        self._move_target = None
+        self._move_sent = False
+        self._fail_count = 0
+        self.player_x = 0
+        self.player_y = 0
+        self._skill_last = 0.0
+        self._pet_last = 0.0
+        self._pet_pid = 0
+
+        self.build_ui()
+        self.update_button_text()
+        self.refresh()
+
+        self._log_alive = True
+        self.watchdog_thread = threading.Thread(target=self.watchdog_loop, daemon=True)
+        self.watchdog_thread.start()
+        app_log("=== 辅助启动 pid=%s ===" % getattr(self.game, "pid", "?"))
+        if self._stealth:
+            self._install_stealth_hotkey()
+            self.root.after(120, self._poll_stealth_hotkey)
+            app_log("[隐藏] 窗口已隐藏, Home 显示/隐藏")
+
+
+    def _install_stealth_hotkey(self):
+        try:
+            user32 = ctypes.windll.user32
+            hotkey_id = 0x5448
+            mods = 0
+            vk_key = 0x24
+
+            def _loop():
+                try:
+                    if not user32.RegisterHotKey(None, hotkey_id, mods, vk_key):
+                        self._stealth_hotkey_q.put(False)
+                        return
+                    msg = ctypes.wintypes.MSG()
+                    while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                        if msg.message == 0x0312 and int(msg.wParam) == hotkey_id:
+                            self._stealth_hotkey_q.put(True)
+                except Exception:
+                    pass
+
+            threading.Thread(target=_loop, daemon=True).start()
+        except Exception:
+            pass
+
+    def _poll_stealth_hotkey(self):
+        try:
+            while True:
+                self._stealth_hotkey_q.get_nowait()
+                if self.root.state() == "withdrawn":
+                    self.root.deiconify()
+                    self.root.lift()
+                    self.root.focus_force()
+                else:
+                    self.root.withdraw()
+        except queue.Empty:
+            pass
+        except Exception:
+            pass
+        try:
+            self.root.after(120, self._poll_stealth_hotkey)
+        except Exception:
+            pass
+
+    def build_ui(self):
+        # 功能"启用"勾选框的文字用绿色(与普通项区分)
+        try:
+            ttk.Style().configure("Green.TCheckbutton", foreground="#009900")
+        except Exception:
+            pass
+        top = ttk.Frame(self.root, padding=10)
+        top.pack(fill="x")
+
+        self.status_label = ttk.Label(top, text=self.status_text())
+        self.status_label.pack(side="left")
+
+        self.unbind_button = ttk.Button(top, text="解绑", width=6, command=self.unbind)
+        self.unbind_button.pack(side="right", padx=(0, 6))
+
+        # 客户端配置(clients.json): 启动时自动选定, 界面只显示(状态栏), 不做下拉切换
+        self.client_profiles = load_client_profiles()
+        try:
+            self._build_bind_drag(top)   # 拖拽准星绑定
+        except Exception:
+            pass
+
+        info = ttk.Frame(self.root, padding=(10, 0, 10, 6))
+        info.pack(fill="x")
+
+        self.count_label = ttk.Label(info, text="怪物数量：0", font=("Microsoft YaHei", 9, "bold"))
+        self.count_label.pack(side="left")
+
+        self.target_label = ttk.Label(info, text="状态：未开始挂机", foreground="#888888")
+        self.target_label.pack(side="left", padx=(12, 0))
+
+        # ==================== 内容区: Notebook 原生分页 ====================
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        # ---------- 页1: 怪物列表 ----------
+        tab_mon = ttk.Frame(self.notebook)
+        self.notebook.add(tab_mon, text="   怪物列表   ")
+
+        columns = ("idx", "name", "x", "y", "hp", "dist")
+
+        # 顶部: 过滤模式 (和拾取列表完全一样的布局)
+        mon_top = ttk.Frame(tab_mon, padding=(8, 8, 8, 4))
+        mon_top.pack(fill="x")
+        ttk.Label(mon_top, text="过滤").pack(side="left")
+        self.mon_filter_mode = ttk.Combobox(mon_top, width=6, state="readonly",
+                                            values=("不过滤", "只打", "不打"))
+        self.mon_filter_mode.set("不过滤")
+        self.mon_filter_mode.pack(side="left", padx=3)
+        ttk.Label(mon_top, text="过滤关键词写在右边，一行一个",
+                  foreground="#888888").pack(side="left", padx=(6, 0))
+
+
+        # 上=怪物列表, 下=NPC屏蔽; 中间横线可上下拖动改变高度
+        mon_paned = ttk.PanedWindow(tab_mon, orient="vertical")
+        mon_paned.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+        mon_body = ttk.Frame(mon_paned)
+        try:
+            mon_paned.add(mon_body, weight=4)
+        except Exception:
+            mon_paned.add(mon_body)
+        mon_left = ttk.Frame(mon_body)
+        mon_left.pack(side="left", fill="both", expand=True)
+
+        self.tree = ttk.Treeview(mon_left, columns=columns, show="headings", height=8)
+        self.tree.heading("idx", text="#")
+        self.tree.heading("name", text="名称")
+        self.tree.heading("x", text="X")
+        self.tree.heading("y", text="Y")
+        self.tree.heading("hp", text="血量")
+        self.tree.heading("dist", text="距离")
+        self.tree.column("idx", width=34, anchor="center")
+        self.tree.column("name", width=110, anchor="w")
+        self.tree.column("x", width=50, anchor="center")
+        self.tree.column("y", width=50, anchor="center")
+        self.tree.column("hp", width=84, anchor="center")
+        self.tree.column("dist", width=46, anchor="center")
+        self.tree.tag_configure("current", background="#FFF3C4")
+        self.tree.tag_configure("stuck", foreground="#999999")
+        sb1 = ttk.Scrollbar(mon_left, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb1.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb1.pack(side="right", fill="y")
+
+        # 右: 过滤关键词(一行一个), 和拾取列表一样
+        mon_right = ttk.Frame(mon_body)
+        mon_right.pack(side="left", fill="y", padx=(8, 0))
+        mfbox = ttk.Frame(mon_right)
+        mfbox.pack(fill="both", expand=True)
+        self.mon_filter = tk.Text(mfbox, width=10, height=1, wrap="none")
+        sbm = ttk.Scrollbar(mfbox, orient="vertical", command=self.mon_filter.yview)
+        self.mon_filter.configure(yscrollcommand=sbm.set)
+        self.mon_filter.pack(side="left", fill="both", expand=True)
+        sbm.pack(side="right", fill="y")
+        self.mon_filter.bind("<FocusOut>", lambda _e: self.save_config())
+
+        # 下格: NPC 屏蔽(只有"NPC 跑进怪物列表"才需要 -> 用上面【拉黑选中的NPC】)
+        mon_bottom = ttk.Frame(mon_paned, padding=(0, 6, 0, 0))
+        try:
+            mon_paned.add(mon_bottom, weight=1)
+        except Exception:
+            mon_paned.add(mon_bottom)
+        ttk.Separator(mon_bottom, orient="horizontal").pack(fill="x")
+
+
+        npc_bar = ttk.Frame(mon_bottom, padding=(0, 4, 0, 2))
+        npc_bar.pack(fill="x")
+        ttk.Button(npc_bar, text="拉黑NPC",
+                   command=self.block_selected_monster_name).pack(side="left")
+        self.npc_entry = ttk.Entry(npc_bar, width=10)
+        self.npc_entry.pack(side="left", padx=(4, 4))
+        ttk.Button(npc_bar, text="屏蔽NPC", command=self.add_npc_name).pack(side="left")
+        ttk.Label(npc_bar, text="已屏蔽NPC").pack(side="left", padx=(10, 0))
+        self.npc_box = ttk.Combobox(npc_bar, width=12, state="readonly", values=())
+        self.npc_box.pack(side="left", padx=(4, 4))
+        ttk.Button(npc_bar, text="移除", command=self.remove_npc_item).pack(side="left")
+        self.npc_label = ttk.Label(npc_bar, text="已屏蔽：0", foreground="#888888")
+        self.npc_label.pack(side="left", padx=(10, 0))
+
+        # ---------- 页2: 拾取列表 ----------
+        tab_item = ttk.Frame(self.notebook)
+        self.notebook.add(tab_item, text="   拾取列表   ")
+
+        # 顶部: 过滤模式
+        item_top = ttk.Frame(tab_item, padding=(8, 8, 8, 4))
+        item_top.pack(fill="x")
+        ttk.Label(item_top, text="过滤").pack(side="left")
+        self.pick_filter_mode = ttk.Combobox(item_top, width=6, state="readonly",
+                                             values=("不过滤", "只捡", "不捡"))
+        self.pick_filter_mode.set("不过滤")
+        self.pick_filter_mode.pack(side="left", padx=3)
+        ttk.Label(item_top, text="过滤关键词写在右边，一行一个",
+                  foreground="#888888").pack(side="left", padx=(6, 0))
+
+        body = ttk.Frame(tab_item)
+        body.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+        # 左: 物品列表
+        left = ttk.Frame(body)
+        left.pack(side="left", fill="both", expand=True)
+        icols = ("ii", "inm", "ix", "iy", "id", "ia")
+        self.item_tree = ttk.Treeview(left, columns=icols, show="headings", height=8)
+        for c, t, w in (("ii", "#", 30), ("inm", "名称", 100), ("ix", "X", 46),
+                        ("iy", "Y", 46), ("id", "距离", 42), ("ia", "对象地址", 80)):
+            self.item_tree.heading(c, text=t)
+            self.item_tree.column(c, width=w, anchor="center")
+        self.item_tree.tag_configure("skip", foreground="#999999")
+        sb2 = ttk.Scrollbar(left, orient="vertical", command=self.item_tree.yview)
+        self.item_tree.configure(yscrollcommand=sb2.set)
+        self.item_tree.pack(side="left", fill="both", expand=True)
+        sb2.pack(side="right", fill="y")
+
+        # 右: 可编辑的过滤关键词表(一行一个)
+        right = ttk.Frame(body)
+        right.pack(side="left", fill="y", padx=(8, 0))
+        fbox = ttk.Frame(right)
+        fbox.pack(fill="both", expand=True)
+        # height=1 是故意的: 不让文本框自己决定高度, 交给 fill/expand 跟左边列表撑一样高
+        self.pick_filter = tk.Text(fbox, width=10, height=1, wrap="none")
+        sbf = ttk.Scrollbar(fbox, orient="vertical", command=self.pick_filter.yview)
+        self.pick_filter.configure(yscrollcommand=sbf.set)
+        self.pick_filter.pack(side="left", fill="both", expand=True)
+        sbf.pack(side="right", fill="y")
+        # 改完点别处就自动存一次, 免得忘了按"保存"
+        self.pick_filter.bind("<FocusOut>", lambda _e: self.save_config())
+        # ---------- 页3: 背包 ----------
+        tab_bag = ttk.Frame(self.notebook)
+        self.notebook.add(tab_bag, text="   背包   ")
+
+        bag_top = ttk.Frame(tab_bag, padding=(6, 6, 6, 2))
+        bag_top.pack(fill="x")
+        self.bag_label = ttk.Label(bag_top, text="背包 占用 --/%d" % BAG_SLOT_COUNT,
+                                   font=("Microsoft YaHei", 10, "bold"),
+                                   foreground="#0066CC")
+        self.bag_label.pack(side="left")
+
+        bcols = ("bs", "bn", "bid")
+        self.bag_tree = ttk.Treeview(tab_bag, columns=bcols, show="headings", height=8)
+        self.bag_tree.heading("bs", text="格子")
+        self.bag_tree.heading("bn", text="物品名称")
+        self.bag_tree.heading("bid", text="类别ID")
+        self.bag_tree.column("bs", width=70, anchor="center")
+        self.bag_tree.column("bn", width=240, anchor="w")
+        self.bag_tree.column("bid", width=100, anchor="center")
+        self.bag_tree.tag_configure("empty", foreground="#AAAAAA")
+        sb3 = ttk.Scrollbar(tab_bag, orient="vertical", command=self.bag_tree.yview)
+        self.bag_tree.configure(yscrollcommand=sb3.set)
+        self.bag_tree.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=(0, 6))
+        sb3.pack(side="right", fill="y", padx=(0, 6), pady=(0, 6))
+
+        # ---------- 页4: 技能（人物信息与技能功能整合） ----------
+        tab_skill = ttk.Frame(self.notebook)
+        self.notebook.add(tab_skill, text="   挂机技能   ")
+
+        info = ttk.LabelFrame(tab_skill, text="人物信息", padding=4)
+        info.pack(fill="x", padx=8, pady=(8, 3))
+        self.info_frame = info
+        # 用 grid + 固定字符宽度, 数字变长(128/128)也不会把后面的"负重"挤走
+        self.hp_label = ttk.Label(info, text="血量 --/--", width=12, anchor="w",
+                                  foreground="#0066CC")
+        self.hp_label.grid(row=0, column=0, padx=(0, 4), sticky="w")
+        for _c in (1, 3, 5):            # 三条进度条所在列可伸缩
+            info.grid_columnconfigure(_c, weight=1)
+        # 系统默认进度条太细 -> 用派生样式把它加粗(颜色/外观仍走系统主题)
+        try:
+            ttk.Style().configure("Big.Horizontal.TProgressbar", thickness=24)
+        except Exception:
+            pass
+        _bar_style = "Big.Horizontal.TProgressbar"
+        self.hp_bar = ttk.Progressbar(info, length=60, maximum=100, style=_bar_style)
+        self.hp_bar.grid(row=0, column=1, sticky="ew")
+        self.w_bag_label = ttk.Label(info, text="背包 --/%d" % BAG_SLOT_COUNT,
+                                     width=12, anchor="w", foreground="#0066CC")
+        self.w_bag_label.grid(row=0, column=2, padx=(8, 4), sticky="w")
+        self.bag_bar = ttk.Progressbar(info, length=60, maximum=100, style=_bar_style)
+        self.bag_bar.grid(row=0, column=3, sticky="ew")
+        self.w_label = ttk.Label(info, text="负重 --/--", width=12, anchor="w",
+                                 foreground="#8A6D00")
+        self.w_label.grid(row=0, column=4, padx=(8, 4), sticky="w")
+        self.w_bar = ttk.Progressbar(info, length=60, maximum=100, style=_bar_style)
+        self.w_bar.grid(row=0, column=5, sticky="ew")
+
+        sk = ttk.LabelFrame(tab_skill, text="治愈术", padding=4)
+        sk.pack(fill="x", padx=8, pady=3)
+        self.hp_btn = ttk.Button(sk, text="开始", width=8,
+                                 command=self.toggle_auto_hp)
+        self.hp_enable = tk.BooleanVar(value=True)
+        tk.Checkbutton(sk, text="启用", variable=self.hp_enable,
+                       bg="#009900", fg="#FFFFFF",
+                       activebackground="#00B300", activeforeground="#FFFFFF",
+                       selectcolor="#006600", bd=0, highlightthickness=0,
+                       command=self._sync_guaji_features).pack(side="left")
+        ttk.Label(sk, text="血量<").pack(side="left", padx=(8, 0))
+        self.hp_thresh = ttk.Entry(sk, width=5)
+        self.hp_thresh.insert(0, "50")
+        self.hp_thresh.pack(side="left", padx=3)
+        self.hp_unit = ttk.Combobox(sk, width=5, state="readonly",
+                                    values=("数值", "百分比"))
+        self.hp_unit.current(1)
+        self.hp_unit.pack(side="left")
+        ttk.Label(sk, text="技能键").pack(side="left", padx=(8, 0))
+        self.hp_key = ttk.Combobox(sk, width=5, state="readonly",
+                                   values=("F1","F2","F3","F4","F5","F6","F7","F8"))
+        self.hp_key.current(0)
+        self.hp_key.pack(side="left", padx=3)
+        ttk.Label(sk, text="间隔").pack(side="left", padx=(8, 0))
+        self.hp_interval = ttk.Entry(sk, width=6)
+        self.hp_interval.insert(0, "500")
+        self.hp_interval.pack(side="left", padx=3)
+        ttk.Label(sk, text="ms").pack(side="left")
+        self.hp_state = ttk.Label(sk, text="已停止", foreground="#888888")
+        self.hp_state.pack(side="left", padx=(10, 0))
+
+        skill_box = ttk.LabelFrame(tab_skill, text="隐身技能", padding=4)
+        skill_box.pack(fill="x", padx=8, pady=3)
+        self.skill_btn = ttk.Button(skill_box, text="开始", width=8,
+                                    command=self.toggle_auto_skill)
+        self.skill_enable = tk.BooleanVar(value=True)
+        tk.Checkbutton(skill_box, text="启用", variable=self.skill_enable,
+                       bg="#009900", fg="#FFFFFF",
+                       activebackground="#00B300", activeforeground="#FFFFFF",
+                       selectcolor="#006600", bd=0, highlightthickness=0,
+                       command=self._sync_guaji_features).pack(side="left")
+        ttk.Label(skill_box, text="距≤").pack(side="left", padx=(6, 0))
+        self.skill_range = ttk.Entry(skill_box, width=4)
+        self.skill_range.insert(0, "2")
+        self.skill_range.pack(side="left", padx=3)
+        ttk.Label(skill_box, text="怪≥").pack(side="left", padx=(6, 0))
+        self.skill_count = ttk.Entry(skill_box, width=4)
+        self.skill_count.insert(0, "3")
+        self.skill_count.pack(side="left", padx=3)
+        ttk.Label(skill_box, text="键").pack(side="left", padx=(6, 0))
+        self.skill_key = ttk.Combobox(skill_box, width=5, state="readonly",
+                                   values=("F1","F2","F3","F4","F5","F6","F7","F8"))
+        self.skill_key.set("F2")
+        self.skill_key.pack(side="left", padx=3)
+        ttk.Label(skill_box, text="隔").pack(side="left", padx=(6, 0))
+        self.skill_interval = ttk.Entry(skill_box, width=5)
+        self.skill_interval.insert(0, "1000")
+        self.skill_interval.pack(side="left", padx=3)
+        ttk.Label(skill_box, text="ms").pack(side="left")
+        self.skill_state = ttk.Label(skill_box, text="已停止", foreground="#888888")
+        self.skill_state.pack(side="left", padx=(10, 0))
+        self.skill_count_label = ttk.Label(skill_box, text="范围 --只", foreground="#0066CC")
+        self.skill_count_label.pack(side="left", padx=(8, 0))
+
+        pet_box = ttk.LabelFrame(tab_skill, text="宠物召唤", padding=4)
+        pet_box.pack(fill="x", padx=8, pady=3)
+        self.pet_btn = ttk.Button(pet_box, text="开始", width=8,
+                                  command=self.toggle_auto_pet)
+        self.pet_enable = tk.BooleanVar(value=True)
+        tk.Checkbutton(pet_box, text="启用", variable=self.pet_enable,
+                       bg="#009900", fg="#FFFFFF",
+                       activebackground="#00B300", activeforeground="#FFFFFF",
+                       selectcolor="#006600", bd=0, highlightthickness=0,
+                       command=self._sync_guaji_features).pack(side="left")
+        ttk.Label(pet_box, text="键").pack(side="left", padx=(8, 0))
+        self.pet_key = ttk.Combobox(pet_box, width=5, state="readonly",
+                                    values=("F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8"))
+        self.pet_key.set("F8")
+        self.pet_key.pack(side="left", padx=3)
+        self.pet_state = ttk.Label(pet_box, text="不存在", foreground="#888888")
+        self.pet_state.pack(side="left", padx=(10, 0))
+        self.pet_info = ttk.Label(pet_box, text="--", foreground="#0066CC")
+        self.pet_info.pack(side="left", padx=(8, 0))
+
+        wl = ttk.LabelFrame(tab_skill, text="背包负重", padding=4)
+        wl.pack(fill="x", padx=8, pady=3)
+        self.w_enable = tk.BooleanVar(value=False)
+        tk.Checkbutton(wl, text="启用", variable=self.w_enable,
+                       bg="#009900", fg="#FFFFFF",
+                       activebackground="#00B300", activeforeground="#FFFFFF",
+                       selectcolor="#006600", bd=0, highlightthickness=0,
+                       padx=4).pack(side="left")
+
+        self.w_bag_on = tk.BooleanVar(value=True)
+        ttk.Checkbutton(wl, text="背包", variable=self.w_bag_on).pack(side="left", padx=(6, 0))
+        self.w_bag_thresh = ttk.Entry(wl, width=3)
+        self.w_bag_thresh.insert(0, "39")
+        self.w_bag_thresh.pack(side="left", padx=(0, 2))
+        ttk.Label(wl, text="格").pack(side="left")
+
+        self.w_wt_on = tk.BooleanVar(value=True)
+        ttk.Checkbutton(wl, text="负重", variable=self.w_wt_on).pack(side="left", padx=(8, 0))
+        self.w_thresh = ttk.Entry(wl, width=3)
+        self.w_thresh.insert(0, "98")
+        self.w_thresh.pack(side="left", padx=(0, 2))
+        ttk.Label(wl, text="%").pack(side="left")
+
+        self.w_action = tk.StringVar(value="stop")
+        ttk.Radiobutton(wl, text="关掉捡物", variable=self.w_action,
+                        value="stop").pack(side="left", padx=(8, 2))
+        ttk.Radiobutton(wl, text="按键", variable=self.w_action,
+                        value="key").pack(side="left", padx=(4, 0))
+        self.w_key = ttk.Combobox(wl, width=3, state="readonly",
+                                  values=("1","2","3","4","5","6"))
+        self.w_key.set("6")
+        self.w_key.pack(side="left", padx=3)
+        self.w_state = ttk.Label(wl, text="未启用", foreground="#888888")
+        self.w_state.pack(side="left", padx=(10, 0))
+        # ---------- 技能页底部: 自动捡物 / 自动攻击 / 开始寻路 一排 + 保存 ----------
+        bottom = ttk.Frame(tab_skill)
+        # 用 side="top"(默认) 紧跟"背包负重"那一行:
+        # 若用 side="bottom", 窗口被拉高时所有富余空间都会堆在这一行上面,
+        # 造成"背包负重"和底部按钮之间裂开一大块空白。
+        bottom.pack(fill="x", padx=8, pady=(3, 6))
+        # 自动捡物 + 范围
+        self.pick_btn = ttk.Button(bottom, text="自动捡物", width=9,
+                                   command=self.toggle_auto_pickup)
+        self.pickup_enable = tk.BooleanVar(value=True)
+        tk.Checkbutton(bottom, text="捡物", variable=self.pickup_enable,
+                       bg="#009900", fg="#FFFFFF",
+                       activebackground="#00B300", activeforeground="#FFFFFF",
+                       selectcolor="#006600", bd=0, highlightthickness=0,
+                       command=self._sync_guaji_features).pack(side="left")
+        ttk.Label(bottom, text="范围").pack(side="left", padx=(6, 0))
+        self.pick_range = ttk.Entry(bottom, width=3)
+        self.pick_range.insert(0, "8")
+        self.pick_range.pack(side="left", padx=2)
+        ttk.Label(bottom, text="格").pack(side="left")
+        # 自动攻击 / 开始寻路
+        self.attack_button = ttk.Button(bottom, text="自动攻击", width=9,
+                                        command=self.toggle_auto_attack)
+        self.attack_enable = tk.BooleanVar(value=True)
+        tk.Checkbutton(bottom, text="攻击", variable=self.attack_enable,
+                       bg="#009900", fg="#FFFFFF",
+                       activebackground="#00B300", activeforeground="#FFFFFF",
+                       selectcolor="#006600", bd=0, highlightthickness=0,
+                       command=self._sync_guaji_features).pack(side="left", padx=(6, 0))
+        # 不抢怪/有人就闪: 都是【攻击】的子选项(必须勾了【攻击】才起作用, 单独勾没用)
+        self.no_steal_var = tk.BooleanVar(value=bool(NO_STEAL))
+        ttk.Checkbutton(bottom, text="不抢怪", variable=self.no_steal_var,
+                        command=self.toggle_no_steal).pack(side="left", padx=(8, 0))
+        # 有人就闪
+        self.avoid_players_var = tk.BooleanVar(value=bool(AVOID_PLAYERS))
+        ttk.Checkbutton(bottom, text="有人就闪", variable=self.avoid_players_var,
+                        command=self.toggle_avoid_players).pack(side="left", padx=(8, 0))
+        self.route_btn = ttk.Button(bottom, text="开始寻路", width=9,
+                                    command=self.toggle_route)
+        self.route_enable = tk.BooleanVar(value=False)
+        tk.Checkbutton(bottom, text="寻路", variable=self.route_enable,
+                       bg="#009900", fg="#FFFFFF",
+                       activebackground="#00B300", activeforeground="#FFFFFF",
+                       selectcolor="#006600", bd=0, highlightthickness=0,
+                       command=self._sync_guaji_features).pack(side="left", padx=(6, 0))
+        # 总开关: 开始/停止挂机(扫描 + 控制启用的功能)
+        self.guaji_btn = ttk.Button(bottom, text="开始挂机", width=9,
+                                    command=self.toggle_guaji)
+        self.guaji_btn.pack(side="left", padx=(10, 0))
+        self.pick_state = ttk.Label(bottom, text="已停止", foreground="#888888")
+        # 保存放最右边(贴边框), 提示在它左边
+        self.save_btn = ttk.Button(bottom, text="保存", width=7,
+                                   command=self.save_config)
+        self.save_btn.pack(side="right")
+        self.save_hint = ttk.Label(bottom, text="", foreground="#009900")
+        self.save_hint.pack(side="right", padx=(0, 6))
+        tab_dm = ttk.Frame(self.notebook)
+        self.tab_dm = tab_dm
+        self.notebook.add(tab_dm, text="   大漠后台   ")
+
+        dm_box = ttk.LabelFrame(tab_dm, text="大漠后台键鼠", padding=(8, 6))
+        dm_box.pack(fill="x", padx=8, pady=8)
+
+        dm_row1 = ttk.Frame(dm_box)
+        dm_row1.pack(fill="x", pady=(0, 3))
+        self.dm_enable_var = tk.BooleanVar(value=bool(self.game.dm_input.enabled))
+        self.dm_check = tk.Checkbutton(
+            dm_row1, text="启用", variable=self.dm_enable_var,
+            bg="#009900", fg="#FFFFFF",
+            activebackground="#00B300", activeforeground="#FFFFFF",
+            selectcolor="#006600", bd=0, highlightthickness=0,
+            command=self.toggle_dm_input)
+        self.dm_check.pack(side="left")
+        ttk.Label(dm_row1, text="注册码").pack(side="left", padx=(8, 2))
+        self.dm_reg_code_var = tk.StringVar(value=self.game.dm_input.reg_code)
+        self.dm_reg_code = ttk.Entry(dm_row1, textvariable=self.dm_reg_code_var, width=30)
+        self.dm_reg_code.pack(side="left")
+        ttk.Label(dm_row1, text="附加码").pack(side="left", padx=(8, 2))
+        self.dm_reg_extra_var = tk.StringVar(value=self.game.dm_input.reg_extra)
+        self.dm_reg_extra = ttk.Entry(dm_row1, textvariable=self.dm_reg_extra_var, width=16)
+        self.dm_reg_extra.pack(side="left")
+
+        dm_row2 = ttk.Frame(dm_box)
+        dm_row2.pack(fill="x")
+        ttk.Label(dm_row2, text="图色").pack(side="left")
+        self.dm_display_var = tk.StringVar(value=self.game.dm_input.display)
+        self.dm_display = ttk.Combobox(
+            dm_row2, textvariable=self.dm_display_var, width=7, state="readonly",
+            values=("normal", "gdi", "dx", "dx2", "dx3"))
+        self.dm_display.pack(side="left", padx=(2, 8))
+        ttk.Label(dm_row2, text="鼠标").pack(side="left")
+        self.dm_mouse_var = tk.StringVar(value=self.game.dm_input.mouse)
+        self.dm_mouse = ttk.Combobox(
+            dm_row2, textvariable=self.dm_mouse_var, width=8, state="readonly",
+            values=("normal", "windows", "windows2", "windows3", "dx"))
+        self.dm_mouse.pack(side="left", padx=(2, 8))
+        ttk.Label(dm_row2, text="键盘").pack(side="left")
+        self.dm_keyboard_var = tk.StringVar(value=self.game.dm_input.keyboard)
+        self.dm_keyboard = ttk.Combobox(
+            dm_row2, textvariable=self.dm_keyboard_var, width=8, state="readonly",
+            values=("normal", "windows", "windows2", "windows3", "dx"))
+        self.dm_keyboard.pack(side="left", padx=(2, 8))
+
+        dm_row3 = ttk.Frame(dm_box)
+        dm_row3.pack(fill="x", pady=(4, 0))
+        self.dm_init_btn = ttk.Button(dm_row3, text="初始化并注册", width=12,
+                                      command=self.dm_initialize)
+        self.dm_init_btn.pack(side="left", padx=(0, 4))
+        self.dm_bind_btn = ttk.Button(dm_row3, text="绑定", width=6,
+                                      command=self.dm_bind_window)
+        self.dm_bind_btn.pack(side="left", padx=(0, 4))
+        self.dm_unbind_btn = ttk.Button(dm_row3, text="解绑", width=6,
+                                        command=self.dm_unbind_window)
+        self.dm_unbind_btn.pack(side="left", padx=(0, 4))
+        self.dm_save_btn = ttk.Button(dm_row3, text="保存", width=6,
+                                      command=self.dm_save_config)
+        self.dm_save_btn.pack(side="left")
+
+        dm_info = ttk.Frame(dm_box)
+        dm_info.pack(fill="x", pady=(3, 0))
+        self.dm_window_label = ttk.Label(dm_info, text="窗口: 当前游戏窗口",
+                                         foreground="#0066CC")
+        self.dm_window_label.pack(side="left")
+        self.dm_status_label = ttk.Label(
+            dm_info,
+            text="已注册" if self.game.dm_input.enabled else "未启用",
+            foreground="#009900" if self.game.dm_input.enabled else "#888888")
+        self.dm_status_label.pack(side="left", padx=(12, 0))
+
+        # ---------- 页: 自动寻路 ----------
+        tab_route = ttk.Frame(self.notebook)
+        self.notebook.add(tab_route, text="   路线设置   ")
+
+        # 第一排: 录制路线 / 批量粘贴 / X Y / 添加
+        r_top = ttk.Frame(tab_route, padding=(8, 8, 8, 2))
+        r_top.pack(fill="x")
+        self.route_rec_btn = ttk.Button(r_top, text="录制路线", width=10,
+                                        command=self.toggle_route_record)
+        self.route_rec_btn.pack(side="left")
+        ttk.Button(r_top, text="批量粘贴", width=9,
+                   command=self.route_bulk).pack(side="left", padx=(6, 0))
+        ttk.Label(r_top, text="X").pack(side="left", padx=(10, 0))
+        self.route_x = ttk.Entry(r_top, width=6)
+        self.route_x.pack(side="left", padx=3)
+        ttk.Label(r_top, text="Y").pack(side="left", padx=(6, 0))
+        self.route_y = ttk.Entry(r_top, width=6)
+        self.route_y.pack(side="left", padx=3)
+        ttk.Button(r_top, text="添加", width=6,
+                   command=self.route_add).pack(side="left", padx=(6, 0))
+
+        # 第二排: 删除 / 清空 / 取坐标 + 状态
+        r_edit = ttk.Frame(tab_route, padding=(8, 2, 8, 4))
+        r_edit.pack(fill="x")
+        ttk.Button(r_edit, text="删除", width=6,
+                   command=self.route_del).pack(side="left")
+        ttk.Button(r_edit, text="清空", width=6,
+                   command=self.route_clear).pack(side="left", padx=(6, 0))
+        ttk.Button(r_edit, text="取坐标", width=7,
+                   command=self.route_cur).pack(side="left", padx=(6, 0))
+        self.route_state = ttk.Label(r_edit, text="已停止", foreground="#888888")
+        self.route_state.pack(side="left", padx=(12, 0))
+
+        # 方案存取: 放在最下面(列表下方)
+        r_save = ttk.Frame(tab_route, padding=(8, 2, 8, 4))
+        r_save.pack(side="bottom", fill="x", pady=(2, 4))
+        ttk.Button(r_save, text="保存", width=6,
+                   command=self.route_save_named).pack(side="left")
+        self.route_name = ttk.Entry(r_save, width=10)
+        self.route_name.pack(side="left", padx=4)
+        ttk.Label(r_save, text="方案名", foreground="#888888").pack(side="left")
+        ttk.Label(r_save, text="  方案").pack(side="left")
+        self.route_saved = ttk.Combobox(r_save, width=11, state="readonly", values=())
+        self.route_saved.pack(side="left", padx=4)
+        ttk.Button(r_save, text="读取", width=6,
+                   command=self.route_load_named).pack(side="left", padx=(0, 6))
+        ttk.Button(r_save, text="删除", width=6,
+                   command=self.route_del_named).pack(side="left")
+
+        rcols = ("ri", "rx", "ry")
+        self.route_tree = ttk.Treeview(tab_route, columns=rcols, show="headings", height=8)
+        self.route_tree.heading("ri", text="#")
+        self.route_tree.heading("rx", text="目标 X")
+        self.route_tree.heading("ry", text="目标 Y")
+        self.route_tree.column("ri", width=60, anchor="center")
+        self.route_tree.column("rx", width=120, anchor="center")
+        self.route_tree.column("ry", width=120, anchor="center")
+        self.route_tree.tag_configure("cur", background="#FFF3C4")
+        self.route_tree.tag_configure("unreachable", foreground="#999999")
+        sb5 = ttk.Scrollbar(tab_route, orient="vertical", command=self.route_tree.yview)
+        self.route_tree.configure(yscrollcommand=sb5.set)
+        self.route_tree.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=(0, 8))
+        sb5.pack(side="right", fill="y", padx=(0, 8), pady=(0, 8))
+
+        self.route_points = []
+        self.route_idx = 0
+        self.route_unreachable = set()
+        self._rt_key = None
+        self._rt_send_t = None
+        self._rt_p0 = None
+        self._rt_moved = False
+        self._rt_best = None
+        self._rt_best_t = 0.0
+        self.auto_route = False
+        self.route_thread = None
+        self.route_recording = False
+        self.route_rec_thread = None
+        self.saved_routes = {}
+        self.route_refresh_list()
+
+        # 标签页顺序: 挂机技能 / 大漠后台 / 路线设置 / 怪物列表 / 地面物品 / 背包
+        # (notebook.insert 对已存在的页签是"移动", 不用重建)
+        self.tab_skill, self.tab_dm, self.tab_route = tab_skill, tab_dm, tab_route
+        self.tab_mon, self.tab_item, self.tab_bag = tab_mon, tab_item, tab_bag
+        try:
+            for _i, _tab in enumerate((tab_skill, tab_dm, tab_route, tab_mon,
+                                       tab_item, tab_bag)):
+                self.notebook.insert(_i, _tab)
+        except Exception:
+            pass
+        # 启动默认停在"挂机技能"页(移动页签后选中项可能还留在原来的怪物列表页)
+        try:
+            self.notebook.select(tab_skill)
+        except Exception:
+            pass
+
+        self.load_config()
+
+        # 启动时按实际需求自动贴合(高度不多不少), 宽度再放宽一点看着舒服
+        try:
+            self.root.update_idletasks()
+            _w, _h = self.root.winfo_reqwidth(), self.root.winfo_reqheight()
+            _w = max(_w, START_MIN_WIDTH)
+            self.root.geometry("%dx%d" % (_w, _h))
+        except Exception:
+            pass
+        # 最小尺寸放开, 用户可以自己把窗口拉大拉小;
+        # 拉到比 420x320 还小就没意义了(内容会挤), 所以只兜这个底。
+        self.root.minsize(420, 320)
+
+
+    # ---------------- 配置 保存 / 读取 ----------------
+    # ---------------- 自动寻路 ----------------
+    def route_refresh_list(self):
+        try:
+            for it in self.route_tree.get_children():
+                self.route_tree.delete(it)
+            for i, pt in enumerate(self.route_points):
+                tags = []
+                if getattr(self, "auto_route", False) and i == self.route_idx:
+                    tags.append("cur")
+                if (int(pt[0]), int(pt[1])) in self.route_unreachable:
+                    tags.append("unreachable")
+                self.route_tree.insert("", "end", values=(i + 1, pt[0], pt[1]), tags=tuple(tags))
+        except Exception:
+            pass
+
+    def route_add(self):
+        try:
+            rx = int(float(self.route_x.get().strip()))
+            ry = int(float(self.route_y.get().strip()))
+        except Exception:
+            self.route_state.configure(text="坐标无效", foreground="#CC0000")
+            return
+        self.route_points.append((rx, ry))
+        self.route_unreachable.discard((rx, ry))
+        self.route_refresh_list()
+        self.route_state.configure(text="已添加 (%d,%d)" % (rx, ry), foreground="#009900")
+
+    def route_del(self):
+        try:
+            sel = self.route_tree.selection()
+            if not sel:
+                return
+            idx = self.route_tree.index(sel[0])
+            if 0 <= idx < len(self.route_points):
+                del self.route_points[idx]
+                if self.route_idx >= len(self.route_points):
+                    self.route_idx = 0
+            self.route_refresh_list()
+        except Exception:
+            pass
+
+    def route_clear(self):
+        self.route_points = []
+        self.route_idx = 0
+        self.route_unreachable.clear()
+        self.route_refresh_list()
+
+    def route_cur(self):
+        try:
+            x, y = self.game.get_player_pos()
+            self.route_x.delete(0, "end")
+            self.route_x.insert(0, str(x))
+            self.route_y.delete(0, "end")
+            self.route_y.insert(0, str(y))
+        except Exception:
+            pass
+
+    def route_bulk(self):
+        """批量粘贴坐标: 每行一个, 支持 313,187 / 313 187 / 313-187"""
+        import re
+        dlg = tk.Toplevel(self.root)
+        dlg.title("批量添加坐标")
+        dlg.geometry("380x360")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        ttk.Label(dlg, text="每行一个坐标，支持  313,187    313 187    313-187",
+                  foreground="#666666").pack(anchor="w", padx=10, pady=(10, 4))
+        txt = tk.Text(dlg, width=44, height=14)
+        txt.pack(fill="both", expand=True, padx=10)
+        txt.focus_set()
+
+        def do_add():
+            raw = txt.get("1.0", "end")
+            pts = []
+            for line in raw.splitlines():
+                nums = re.findall(r"-?\d+", line)
+                if len(nums) >= 2:
+                    try:
+                        pts.append((int(nums[0]), int(nums[1])))
+                    except Exception:
+                        pass
+            if not pts:
+                messagebox.showwarning("提示", "没解析到坐标。", parent=dlg)
+                return
+            self.route_points.extend(pts)
+            self.route_refresh_list()
+            self.route_set_state("批量添加 %d 个点，现在共 %d 个"
+                                 % (len(pts), len(self.route_points)), "#009900")
+            dlg.destroy()
+
+        bar = ttk.Frame(dlg, padding=(10, 6, 10, 10))
+        bar.pack(fill="x")
+        ttk.Button(bar, text="添加", width=10, command=do_add).pack(side="left")
+        ttk.Button(bar, text="取消", width=10,
+                   command=dlg.destroy).pack(side="left", padx=(8, 0))
+
+    def toggle_route_record(self):
+        """录制路线: 监听游戏寻路目标(obj+D4/D8), 点一次小地图就记一个点"""
+        self.route_recording = not getattr(self, "route_recording", False)
+        if self.route_recording:
+            if getattr(self, "auto_route", False):
+                self.toggle_route()            # 录制时先停寻路, 免得互相打架
+            self.route_rec_btn.configure(text="停止录制")
+            self.route_set_state("录制中：在游戏里点小地图选点…", "#0066CC")
+            if self.route_rec_thread is None or not self.route_rec_thread.is_alive():
+                self.route_rec_thread = threading.Thread(
+                    target=self.route_record_loop, daemon=True)
+                self.route_rec_thread.start()
+        else:
+            self.route_rec_btn.configure(text="录制路线")
+            self.route_set_state("已停止  共 %d 个点" % len(self.route_points), "#888888")
+            self.route_refresh_list()
+
+    def route_record_loop(self):
+        """监听移动对象的目标坐标: 在游戏里点一次地图就记一个点
+
+        记一个点要同时满足:
+          1) 目标坐标合法(0..10000)
+          2) 和目标列表里"最后一个点"不同
+          3) 目标值发生了变化  或  人物正在走动(位置在变)
+        开头先读一次当前的内存目标当基线 -> 刚点【录制路线】不会把上一次
+        走路残留的旧目标当成第一个点录进来。
+        """
+        last = None
+        last_pos = None
+        try:
+            _o = self.game.get_move_obj()
+            if _o:
+                _tx = self.game.read_u32(_o + MOVE_OBJ_X)
+                _ty = self.game.read_u32(_o + MOVE_OBJ_Y)
+                if 0 <= _tx <= 10000 and 0 <= _ty <= 10000:
+                    last = (_tx, _ty)
+        except Exception:
+            pass
+        while getattr(self, "route_recording", False):
+            try:
+                o = self.game.get_move_obj()
+                if o:
+                    tx = self.game.read_u32(o + MOVE_OBJ_X)
+                    ty = self.game.read_u32(o + MOVE_OBJ_Y)
+                    try:
+                        px, py = self.game.get_player_pos()
+                    except Exception:
+                        px = py = None
+                    moving = (last_pos is not None and px is not None
+                              and (px, py) != last_pos)
+                    if px is not None:
+                        last_pos = (px, py)
+                    if 0 <= tx <= 10000 and 0 <= ty <= 10000:
+                        changed = (tx, ty) != last
+                        last = (tx, ty)
+                        if (changed or moving) and (
+                                not self.route_points or self.route_points[-1] != (tx, ty)):
+                            self.route_points.append((tx, ty))
+                            self.root.after(0, self.route_refresh_list)
+                            self.root.after(0, self.route_set_state,
+                                            "已录 %d 个点：(%d,%d)"
+                                            % (len(self.route_points), tx, ty),
+                                            "#0066CC")
+                    else:
+                        last = None        # 到达/停止 -> 下次点击重新记
+            except Exception:
+                pass
+            time.sleep(0.2)
+
+    # ---------- 寻路方案: 保存 / 读取 / 删除 ----------
+    def _refresh_saved_routes(self, select=None):
+        """刷新"已存方案"下拉框内容"""
+        try:
+            names = list(self.saved_routes.keys())
+            self.route_saved["values"] = names
+            cur = self.route_saved.get().strip()
+            if select and select in names:
+                self.route_saved.set(select)
+            elif names and cur not in names:
+                self.route_saved.set(names[0])
+            elif not names:
+                self.route_saved.set("")
+        except Exception:
+            pass
+
+    def route_save_named(self):
+        """把当前坐标列表存成一个具名方案"""
+        try:
+            name = self.route_name.get().strip()
+        except Exception:
+            name = ""
+        if not name:
+            self.route_set_state("先输入方案名再点保存", "#CC0000")
+            return
+        if not self.route_points:
+            self.route_set_state("当前坐标列表是空的", "#CC0000")
+            return
+        if name in self.saved_routes and not messagebox.askyesno(
+                "确认", "方案「%s」已存在，覆盖吗？" % name, parent=self.root):
+            return
+        self.saved_routes[name] = [list(p) for p in self.route_points]
+        self._refresh_saved_routes(select=name)
+        self.save_config()
+        self.route_set_state("已保存方案「%s」(%d 个点)" % (name, len(self.route_points)),
+                             "#009900")
+
+    def route_load_named(self):
+        """读取下拉框选中的方案, 覆盖当前坐标列表"""
+        name = ""
+        try:
+            name = self.route_saved.get().strip()
+        except Exception:
+            pass
+        if not name or name not in self.saved_routes:
+            self.route_set_state("先在下拉框选一个方案", "#CC0000")
+            return
+        self.auto_route = False
+        try:
+            self.route_btn.configure(text="开始寻路")
+        except Exception:
+            pass
+        self.route_points = [(int(p[0]), int(p[1])) for p in self.saved_routes[name]]
+        self.route_idx = 0
+        self.route_unreachable.clear()
+        self.route_refresh_list()
+        try:
+            self.route_name.delete(0, "end")
+            self.route_name.insert(0, name)
+        except Exception:
+            pass
+        self.route_set_state("已读取方案「%s」(%d 个点)" % (name, len(self.route_points)),
+                             "#009900")
+
+    def route_del_named(self):
+        """删除下拉框选中的方案(名字+坐标一起删掉)"""
+        name = ""
+        try:
+            name = self.route_saved.get().strip()
+        except Exception:
+            pass
+        if not name or name not in self.saved_routes:
+            self.route_set_state("先在下拉框选一个方案", "#CC0000")
+            return
+        if not messagebox.askyesno("确认", "删除方案「%s」？" % name, parent=self.root):
+            return
+        try:
+            del self.saved_routes[name]
+        except Exception:
+            pass
+        self._refresh_saved_routes()
+        try:
+            if self.route_name.get().strip() == name:
+                self.route_name.delete(0, "end")
+        except Exception:
+            pass
+        self.save_config()
+        self.route_set_state("已删除方案「%s」" % name, "#CC0000")
+
+    def route_set_state(self, text, color="#888888"):
+        try:
+            self.route_state.configure(text=text, foreground=color)
+        except Exception:
+            pass
+
+    def toggle_route(self):
+        self.auto_route = not getattr(self, "auto_route", False)
+        app_log("[\u81ea\u52a8\u5bfb\u8def] %s  \u70b9\u4f4d\u6570=%d" % (("\u5f00\u542f" if self.auto_route else "\u505c\u6b62"), len(getattr(self, "route_points", []))))
+        if self.auto_route:
+            if not self.route_points:
+                self.auto_route = False
+                self.route_set_state("请先添加坐标", "#CC0000")
+                return
+            app_log("[寻路] 开始")
+            if self.route_thread is None or not self.route_thread.is_alive():
+                self.route_thread = threading.Thread(target=self.route_loop, daemon=True)
+                self.route_thread.start()
+            self.route_btn.configure(text="停止寻路")
+            self.route_set_state("运行中", "#009900")
+        else:
+            self._move_release("route")
+            self.route_btn.configure(text="开始寻路")
+            self.route_set_state("已停止", "#888888")
+        self.route_refresh_list()
+
+    def _route_advance(self):
+        n = len(getattr(self, "route_points", []) or [])
+        if n <= 0:
+            self.route_idx = 0
+            return
+        self.route_idx = (self.route_idx + 1) % n
+        self._rt_key = None
+
+    def _route_stop_at_player(self):
+        try:
+            px, py = self.game.get_player_pos()
+            self.game.move_to(px, py)
+        except Exception:
+            try:
+                self.game.stop_move()
+            except Exception:
+                pass
+        with self._move_lock:
+            self._move_state = MOVE_STATE_IDLE
+            self._move_owner = ""
+            self._move_prio = 0
+            self._move_until = 0.0
+            self._move_target = None
+            self._move_sent = False
+
+    def route_loop(self):
+        last_ui = 0.0
+        sent_idx = -1
+        retry = 0
+        idle_since = time.time()
+        self._route_paused = False
+        while self.auto_route:
+            try:
+                if (not getattr(self, "_cur_actor", 0)
+                        and getattr(self, "_move_state", "") == MOVE_STATE_ATTACK):
+                    self._move_finish_attack()
+                if not self.route_points:
+                    time.sleep(0.5)
+                    continue
+                # 【按"能打的怪"数量判断】:
+                #   数量 0 -> 继续寻路; 数量 >0 -> 停下让位给自动攻击(索引不动)。
+                # 和怪物列表共用同一个口径(排除已确认打死的), 再额外排除卡位名单 ——
+                # 否则几个永远打不到的怪会把寻路永久卡住。全卡住时视为"没怪", 继续走。
+                # 【有人就闪】期间: 打怪那边已经放弃了, 寻路必须照走
+                # (否则"打怪不打、寻路也不走" -> 人站原地不动, 实测踩过)
+                if (getattr(self, "auto_attack", False)
+                        and not getattr(self, "_avoid_players_active", False)):
+                    mons = self._attackable_monsters()
+                    if getattr(self.game, "_actor_lookup_failed", False):
+                        mons = list(getattr(self, "_mon_last", []))
+                else:
+                    mons = []
+                monster_present = self._ui_has_monsters()
+                attack_busy = bool(
+                    getattr(self, "auto_attack", False)
+                    and not getattr(self, "_avoid_players_active", False)
+                    and (getattr(self, "_cur_actor", 0) or mons))
+                route_items = []
+                if getattr(self, "auto_pickup", False):
+                    try:
+                        rng = max(1, int(self.pick_range.get().strip() or "8"))
+                        route_items = [it for it in self.game.get_items()
+                                       if it[0] <= rng
+                                       and it[4] not in self._pick_fail
+                                       and self._pick_name_ok(it[1])]
+                    except Exception:
+                        route_items = []
+                if attack_busy or monster_present or route_items:
+                    if not getattr(self, "_route_paused", False):
+                        self._route_paused = True
+                        if attack_busy:
+                            self._attack_hold_until = time.time() + ROUTE_STOP_BEFORE_ATTACK_SEC + 0.5
+                            self._cur_actor = 0
+                            try:
+                                self.game.clear_attack_target()
+                            except Exception:
+                                pass
+                        self._route_stop_at_player()
+                        if attack_busy:
+                            self._attack_hold_until = time.time() + ROUTE_STOP_BEFORE_ATTACK_SEC
+                    sent_idx = -1
+                    retry = 0
+                    self._rt_key = None
+                    if time.time() - last_ui >= 1.0:
+                        last_ui = time.time()
+                        _reason = "怪物" if (attack_busy or monster_present) else "物品"
+                        self.root.after(0, self.route_set_state,
+                                        "发现%s，停止寻路" % _reason, "#CC6600")
+                    time.sleep(0.5)
+                    continue
+                if (not getattr(self, "_cur_actor", 0)
+                        and getattr(self, "_move_state", "") == MOVE_STATE_ATTACK):
+                    self._move_finish_attack()
+                self._route_paused = False
+                if self.route_idx >= len(self.route_points):
+                    self.route_idx = 0
+                gx, gy = self.route_points[self.route_idx]
+                px, py = self.game.get_player_pos()
+                # 跟踪当前点位: 点一变(新坐标 / 打怪暂停恢复后) 就当作"新给的坐标", 重新计时
+                _pt = (self.route_idx, self.route_points[self.route_idx])
+                if getattr(self, "_rt_key", None) != _pt:
+                    self._rt_key = _pt
+                    self._rt_send_t = None
+                    self._rt_p0 = (px, py)
+                    self._rt_moved = False
+                    self._rt_best = None
+                    self._rt_best_t = time.time()
+                if (px, py) != self._rt_p0:
+                    self._rt_moved = True
+                _dist_now = max(abs(px - gx), abs(py - gy))
+                if self._rt_best is None or _dist_now < self._rt_best:
+                    self._rt_best = _dist_now
+                    self._rt_best_t = time.time()
+                # 到达判定放宽 1 格: 目标格常被怪/人占住, 游戏会在旁边停下
+                if abs(px - gx) <= 2 and abs(py - gy) <= 2:
+                    self.route_unreachable.discard((int(gx), int(gy)))
+                    self._route_advance()
+                    sent_idx = -1
+                    retry = 0
+                    idle_since = time.time()
+                    self.root.after(0, self.route_refresh_list)
+                    time.sleep(0.3)
+                    continue
+
+                moving = False
+                try:
+                    moving = self.game.is_moving()
+                except Exception:
+                    pass
+
+                need = False
+                if sent_idx != self.route_idx:
+                    need = True                      # 新目标点 -> 只发一次
+                elif (not moving) and retry > 0 and (time.time() - idle_since) >= ROUTE_RETRY_SEC:
+                    need = True                      # 停下但没到 -> 重发
+
+                if need and self._move_claim("route", MOVE_PRIO_ROUTE, gx, gy):
+                    if self._rt_send_t is None:      # 首次真下发这个点 -> 开始计时
+                        self._rt_send_t = time.time()
+                        self._rt_p0 = (px, py)
+                    sent_idx = self.route_idx
+                    idle_since = time.time()
+                    retry += 1
+                elif need:
+                    # 没拿到移动权(打怪中/等捡物/别人持权) —— 这**不是**"这个点走不到",
+                    # 重置本点计时, 免得计时器空转把好点删掉(踩过: 打怪/捡物占权期间点被删)
+                    self._rt_send_t = None
+                    self._rt_moved = False
+                    self._rt_best_t = time.time()
+                    sent_idx = -1
+                    retry = 0
+                    idle_since = time.time()
+                if moving:
+                    idle_since = time.time()
+
+                # (A) 一步没动: 跳过这个点, 不删除
+                if (self._rt_send_t is not None and not self._rt_moved
+                        and not self._move_busy(MOVE_PRIO_ROUTE)
+                        and (time.time() - self._rt_send_t) >= ROUTE_NO_MOVE_SEC):
+                    _ptxy = self.route_points[self.route_idx]
+                    self.route_unreachable.add((int(_ptxy[0]), int(_ptxy[1])))
+                    app_log("[寻路] 走不通, 跳过执行下一个 (%d,%d)" % (_ptxy[0], _ptxy[1]))
+                    try:
+                        self.root.after(0, self.route_set_state,
+                                        "走不通, 跳过执行下一个 (%d,%d)"
+                                        % (_ptxy[0], _ptxy[1]), "#CC6600")
+                        self.root.after(0, self.route_refresh_list)
+                    except Exception:
+                        pass
+                    self._route_advance()
+                    sent_idx = -1
+                    retry = 0
+                    idle_since = time.time()
+                    time.sleep(0.2)
+                    continue
+                # (B) 动过但距离不再接近: 同样跳过, 不删除
+                if (self._rt_moved
+                        and self._rt_send_t is not None
+                        and not self._move_busy(MOVE_PRIO_ROUTE)
+                        and (time.time() - self._rt_best_t) >= ROUTE_STUCK_SEC):
+                    _ptxy = self.route_points[self.route_idx]
+                    self.route_unreachable.add((int(_ptxy[0]), int(_ptxy[1])))
+                    app_log("[寻路] 走不通, 跳过执行下一个 (%d,%d)" % (_ptxy[0], _ptxy[1]))
+                    try:
+                        self.root.after(0, self.route_set_state,
+                                        "走不通, 跳过执行下一个 (%d,%d)"
+                                        % (_ptxy[0], _ptxy[1]), "#CC6600")
+                        self.root.after(0, self.route_refresh_list)
+                    except Exception:
+                        pass
+                    self._route_advance()
+                    sent_idx = -1
+                    retry = 0
+                    idle_since = time.time()
+                    time.sleep(0.2)
+                    continue
+
+                if time.time() - last_ui >= 1.0:
+                    last_ui = time.time()
+                    self.root.after(0, self.route_set_state,
+                                    "前往 #%d (%d,%d)%s" % (
+                                        self.route_idx + 1, gx, gy,
+                                        "" if moving else " (未移动)"),
+                                    "#009900")
+                    self.root.after(0, self.route_refresh_list)
+            except Exception as e:
+                self.root.after(0, self.route_set_state, "寻路错误: %s" % e, "#CC0000")
+            time.sleep(0.2 if locals().get("moving", False) else 1.0)
+
+    def collect_config(self):
+        def gv(v):
+            try:
+                return bool(v.get())
+            except Exception:
+                return False
+        def ge(e, d=""):
+            try:
+                return e.get().strip()
+            except Exception:
+                return d
+
+        def gt(t):
+            """读多行文本框(过滤关键词表)"""
+            try:
+                return t.get("1.0", "end").strip()
+            except Exception:
+                return ""
+        return {
+            "hp": {"thresh": ge(self.hp_thresh, "50"),
+                   "unit": ge(self.hp_unit, "百分比"),
+                   "key": ge(self.hp_key, "F1"),
+                   "interval": ge(self.hp_interval, "500"),
+                   "enable": gv(self.hp_enable)},
+            "hide": {"range": ge(self.skill_range, "2"),
+                     "count": ge(self.skill_count, "3"),
+                     "key": ge(self.skill_key, "F2"),
+                     "interval": ge(self.skill_interval, "1000"),
+                     "enable": gv(self.skill_enable)},
+            "pet": {"key": ge(self.pet_key, "F8"), "interval": str(PET_INTERVAL_MS),
+                    "enable": gv(self.pet_enable)},
+            "pickup": {"range": ge(self.pick_range, "8"),
+                       "fmode": ge(self.pick_filter_mode, "不过滤"),
+                       "fkeys": gt(self.pick_filter),
+                       "enable": gv(self.pickup_enable)},
+            "monster": {"mode": ge(self.mon_filter_mode, "不过滤"),
+                        "keys": gt(self.mon_filter),
+                        "npc_block": list(getattr(self, "_npc_block", []) or []),
+                        "no_steal": bool(NO_STEAL),
+                        "avoid_players": bool(AVOID_PLAYERS)},
+            "attack": {"enable": gv(self.attack_enable)},
+            "bagweight": {"enable": gv(self.w_enable),
+                          "bag_on": gv(self.w_bag_on),
+                          "bag_thresh": ge(self.w_bag_thresh, "39"),
+                          "wt_on": gv(self.w_wt_on),
+                          "wt_thresh": ge(self.w_thresh, "98"),
+                          "action": ge(self.w_action, "stop"),
+                          "key": ge(self.w_key, "6")},
+            # 只存设置(坐标列表), 不存运行状态:
+            # 自动攻击 / 开始寻路 的开关、以及寻路走到第几个点, 都不落盘。
+            "route": {"points": [list(p) for p in getattr(self, "route_points", [])],
+                      "enable": gv(self.route_enable)},
+            "routes": dict((str(k), [list(p) for p in v])
+                           for k, v in getattr(self, "saved_routes", {}).items()),
+            "proc_name": PROC_NAME_OVERRIDE,
+            "client": ACTIVE_CLIENT,
+        }
+
+    def apply_config(self, cfg):
+        def se(w, v):
+            if v is None:
+                return
+            s = str(v)
+            try:
+                w.set(s)
+                return
+            except Exception:
+                pass
+            try:
+                w.delete(0, "end")
+                w.insert(0, s)
+            except Exception:
+                pass
+        def sv(var, v):
+            try:
+                if v is not None:
+                    var.set(bool(v))
+            except Exception:
+                pass
+        try:
+            c = cfg.get("hp", {})
+            se(self.hp_thresh, c.get("thresh"))
+            se(self.hp_unit, c.get("unit"))
+            se(self.hp_key, c.get("key"))
+            se(self.hp_interval, c.get("interval"))
+            c = cfg.get("hide", {})
+            se(self.skill_range, c.get("range"))
+            se(self.skill_count, c.get("count"))
+            se(self.skill_key, c.get("key"))
+            se(self.skill_interval, c.get("interval"))
+            c = cfg.get("pet", {})
+            if hasattr(self, "pet_key"):
+                se(self.pet_key, c.get("key"))
+            # 回复各功能的"启用"勾选状态
+            sv(self.hp_enable, cfg.get("hp", {}).get("enable"))
+            sv(self.skill_enable, cfg.get("hide", {}).get("enable"))
+            sv(self.pet_enable, cfg.get("pet", {}).get("enable"))
+            sv(self.pickup_enable, cfg.get("pickup", {}).get("enable"))
+            sv(self.attack_enable, cfg.get("attack", {}).get("enable"))
+            sv(self.route_enable, cfg.get("route", {}).get("enable"))
+            c = cfg.get("pickup", {})
+            se(self.pick_range, c.get("range"))
+            se(self.pick_filter_mode, c.get("fmode"))
+            _fk = c.get("fkeys")
+            if _fk is not None:
+                try:
+                    self.pick_filter.delete("1.0", "end")
+                    self.pick_filter.insert("1.0", str(_fk))
+                except Exception:
+                    pass
+            c = cfg.get("monster", {})
+            se(self.mon_filter_mode, c.get("mode"))
+            global NO_STEAL, AVOID_PLAYERS
+            if c.get("no_steal") is not None:
+                NO_STEAL = bool(c.get("no_steal"))
+            try:
+                if hasattr(self, "no_steal_var"):
+                    self.no_steal_var.set(bool(NO_STEAL))
+            except Exception:
+                pass
+            if c.get("avoid_players") is not None:
+                AVOID_PLAYERS = bool(c.get("avoid_players"))
+            try:
+                if hasattr(self, "avoid_players_var"):
+                    self.avoid_players_var.set(bool(AVOID_PLAYERS))
+            except Exception:
+                pass
+            _pn = str(cfg.get("proc_name") or "").strip()
+            if _pn:
+                global PROCESS_NAME, MODULE_NAME, PROC_NAME_OVERRIDE
+                if _pn.lower() != str(PROCESS_NAME).lower():
+                    PROCESS_NAME = _pn
+                    MODULE_NAME = _pn
+                    PROC_NAME_OVERRIDE = _pn
+                    app_log("[绑定] 按 config.json 记的进程名绑定: %s" % _pn)
+            _nb = c.get("npc_block")
+            if isinstance(_nb, list):
+                self._npc_block = [str(x) for x in _nb if str(x).strip()]
+            try:
+                self._update_npc_label()
+            except Exception:
+                pass
+            _mk = c.get("keys")
+            if _mk is not None:
+                try:
+                    self.mon_filter.delete("1.0", "end")
+                    self.mon_filter.insert("1.0", str(_mk))
+                except Exception:
+                    pass
+            c = cfg.get("bagweight", {})
+            sv(self.w_enable, c.get("enable"))
+            sv(self.w_bag_on, c.get("bag_on"))
+            se(self.w_bag_thresh, c.get("bag_thresh"))
+            sv(self.w_wt_on, c.get("wt_on"))
+            se(self.w_thresh, c.get("wt_thresh"))
+            se(self.w_action, c.get("action"))
+            if self.w_action.get() == "ignore":
+                self.w_action.set("stop")
+            se(self.w_key, c.get("key"))
+            r = cfg.get("route", {})
+            pts = r.get("points")
+            if isinstance(pts, list):
+                tmp = []
+                for p in pts:
+                    try:
+                        if len(p) >= 2:
+                            tmp.append((int(p[0]), int(p[1])))
+                    except Exception:
+                        pass
+                self.route_points = tmp
+                # 不恢复寻路进度: 每次启动都从第一个点重新开始
+                self.route_idx = 0
+                if hasattr(self, "route_refresh_list"):
+                    self.route_refresh_list()
+            routes = cfg.get("routes")
+            if isinstance(routes, dict):
+                self.saved_routes = {}
+                for k, v in routes.items():
+                    try:
+                        self.saved_routes[str(k)] = [(int(a), int(b)) for a, b in v]
+                    except Exception:
+                        pass
+                if hasattr(self, "route_saved"):
+                    self._refresh_saved_routes()
+        except Exception:
+            pass
+
+    def save_config(self):
+        try:
+            cfg = self.collect_config()
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            if hasattr(self, "save_hint"):
+                self.save_hint.configure(text="已保存", foreground="#009900")
+                self.root.after(2500, lambda: self.save_hint.configure(text=""))
+        except Exception as e:
+            if hasattr(self, "save_hint"):
+                self.save_hint.configure(text="保存失败: %s" % e,
+                                         foreground="#CC0000")
+
+    def load_config(self):
+        try:
+            # exe 旁边没有 config.json(单文件发布) -> 用打包进 exe 的那份默认设置
+            _src = CONFIG_FILE if os.path.exists(CONFIG_FILE) else CONFIG_DEFAULT
+            with open(_src, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            self.apply_config(cfg)
+        except Exception:
+            pass
+
+    # ---------------- 低血自动放技能 ----------------
+    VK_MAP = {
+        "F1": 0x70, "F2": 0x71, "F3": 0x72, "F4": 0x73, "F5": 0x74, "F6": 0x75,
+        "F7": 0x76, "F8": 0x77, "F9": 0x78, "F10": 0x79, "F11": 0x7A, "F12": 0x7B,
+        "1": 0x31, "2": 0x32, "3": 0x33, "4": 0x34, "5": 0x35,
+        "6": 0x36, "7": 0x37, "8": 0x38, "9": 0x39, "0": 0x30,
+        "Q": 0x51, "E": 0x45, "R": 0x52, "T": 0x54,
+        "Z": 0x5A, "X": 0x58, "C": 0x43, "V": 0x56,
+    }
+
+    def toggle_auto_hp(self):
+        if not getattr(self, "auto_hp", False):
+            self.auto_hp = True
+            self._hp_last = 0.0
+            self.hp_btn.configure(text="停止")
+            self.hp_state.configure(text="运行中", foreground="#009900")
+            threading.Thread(target=self.hp_loop, daemon=True).start()
+        else:
+            self.auto_hp = False
+            self.hp_btn.configure(text="开始")
+            self.hp_state.configure(text="已停止", foreground="#888888")
+
+    def hp_loop(self):
+        while getattr(self, "auto_hp", False):
+            try:
+                hp, mx = self.game.get_player_hp()
+                if hp and mx:
+                    try:
+                        th = float(self.hp_thresh.get().strip() or "50")
+                    except Exception:
+                        th = 50.0
+                    unit = self.hp_unit.get()
+                    if unit == "百分比":
+                        need = (hp * 100.0 / mx) < th
+                        desc = "%.1f%% < %.0f%%" % (hp * 100.0 / mx, th)
+                    else:
+                        need = hp < th
+                        desc = "%d < %.0f" % (hp, th)
+
+                    key = self.hp_key.get().strip().upper()
+                    try:
+                        iv = max(50, int(self.hp_interval.get().strip() or "500"))
+                    except Exception:
+                        iv = 500
+
+                    if need and (time.time() - self._hp_last) * 1000 >= iv:
+                        vk = self.VK_MAP.get(key)
+                        if vk:
+                            self.game.press_key(vk, tag="治疗")
+                            self._hp_last = time.time()
+                            self.hp_state.configure(
+                                text="已按 %s" % key, foreground="#CC6600")
+                    elif not need:
+                        self.hp_state.configure(
+                            text="正常 %d/%d" % (hp, mx),
+                            foreground="#009900")
+                else:
+                    self.hp_state.configure(text="读不到血量", foreground="#CC0000")
+            except Exception as exc:
+                try:
+                    self.hp_state.configure(text="错误", foreground="#CC0000")
+                except Exception:
+                    pass
+            time.sleep(0.15)
+
+    # ---------------- 按周围怪物数量自动放技能 ----------------
+    @staticmethod
+    def _within_skill_range(x, y, px, py, radius):
+        """与怪物列表"距离"列一致：max(|ΔX|, |ΔY|) <= radius（游戏里的"格"）"""
+        return max(abs(x - px), abs(y - py)) <= radius
+
+    def _count_nearby_monsters(self, monsters, px, py, radius):
+        """统计人物周围指定范围内仍存活、且未被标记为死亡的怪物数量。"""
+        dead = getattr(self, "_dead", set())
+        count = 0
+        for m in monsters:
+            if m.get("actor") in dead:
+                continue
+            hp = m.get("hp") or 0
+            max_hp = m.get("max_hp") or 0
+            if hp == 0 and max_hp > 0:
+                continue
+            if self._within_skill_range(m.get("x", 0), m.get("y", 0),
+                                        px, py, radius):
+                count += 1
+        return count
+
+    def toggle_auto_skill(self):
+        if not getattr(self, "auto_skill", False):
+            self.auto_skill = True
+            self._skill_last = 0.0
+            self.skill_btn.configure(text="停止")
+            self.skill_state.configure(text="运行中", foreground="#009900")
+            if self.skill_thread is None or not self.skill_thread.is_alive():
+                self.skill_thread = threading.Thread(target=self.skill_loop, daemon=True)
+                self.skill_thread.start()
+        else:
+            self.auto_skill = False
+            self.skill_btn.configure(text="开始")
+            self.skill_state.configure(text="已停止", foreground="#888888")
+
+    def skill_loop(self):
+        while getattr(self, "auto_skill", False):
+            try:
+                radius = max(0, int(self.skill_range.get().strip() or "2"))
+                limit = max(1, int(self.skill_count.get().strip() or "3"))
+                interval = max(50, int(self.skill_interval.get().strip() or "1000"))
+                key = self.skill_key.get().strip().upper()
+
+                px, py = self.game.get_player_pos()
+                monsters = self._monster_list_for_ui()
+                near_count = self._count_nearby_monsters(monsters, px, py, radius)
+                hidden = self.game.is_player_hidden()
+
+                self.skill_count_label.configure(
+                    text="范围 %d只" % near_count)
+
+                if hidden:
+                    self.skill_state.configure(
+                        text="隐身中", foreground="#009900")
+                elif near_count >= limit:
+                    if time.time() - self._skill_last >= interval / 1000.0:
+                        vk = self.VK_MAP.get(key)
+                        if vk:
+                            self.game.press_key(vk, tag="隐身")
+                            self._skill_last = time.time()
+                            self.skill_state.configure(
+                                text="未隐身，已按 %s" % key,
+                                foreground="#CC6600")
+                        else:
+                            self.skill_state.configure(
+                                text="无效键：%s" % key, foreground="#CC0000")
+                    else:
+                        self.skill_state.configure(
+                            text="未隐身，等待",
+                            foreground="#CC6600")
+                else:
+                    self.skill_state.configure(
+                        text="怪%d只" % near_count,
+                        foreground="#888888")
+            except Exception as exc:
+                try:
+                    self.skill_state.configure(
+                        text="错误", foreground="#CC0000")
+                except Exception:
+                    pass
+            time.sleep(1.0)
+
+    # ---------------- 宠物召唤 ----------------
+    def toggle_auto_pet(self):
+        if not getattr(self, "auto_pet", False):
+            self.auto_pet = True
+            self._pet_last = 0.0
+            # 延迟计时: 从"点开始挂机"那刻算起 -> 宠物整体约 PET_START_DELAY_SEC 秒后按 F8
+            self._pet_start_at = getattr(self, "_guaji_click_at", 0.0) or time.time()
+            self.pet_btn.configure(text="停止")
+            self.pet_state.configure(text="不存在", foreground="#888888")
+            if self.pet_thread is None or not self.pet_thread.is_alive():
+                self.pet_thread = threading.Thread(target=self.pet_loop, daemon=True)
+                self.pet_thread.start()
+        else:
+            self.auto_pet = False
+            self.pet_btn.configure(text="开始")
+            self.pet_state.configure(text="不存在", foreground="#888888")
+
+    def pet_loop(self):
+        """宠物召唤 —— 只有一条规则: 没有活体就召唤。
+
+          · 有活体(近的 / 远的 / 掉出 ActorList 的) -> 绝对不按召唤键
+          · 没有活体(只有尸体 / 一只都没有 / 重进游戏 / 换角色 / 换地图) -> 按召唤键
+
+        死活只看 +0xAC(0=活, 1=尸体)。get_pet(): ① 扫 ActorList ② 直读上次那个宝宝对象。
+        """
+        while getattr(self, "auto_pet", False):
+            try:
+                key = ((self.pet_key.get().strip().upper()
+                        if hasattr(self, "pet_key") else "") or PET_KEY)
+                interval = PET_INTERVAL_MS
+                now = time.time()
+
+                # 启动等待(不是宠物判断): 刚点开始挂机先留时间给用户切回游戏窗口,
+                # 游戏不在前台时按键发不进去
+                _t0 = getattr(self, "_pet_start_at", 0.0)
+                if _t0 and (now - _t0) < PET_START_DELAY_SEC:
+                    _left = PET_START_DELAY_SEC - (now - _t0)
+                    try:
+                        self.pet_state.configure(text="不存在", foreground="#CC6600")
+                    except Exception:
+                        pass
+                    time.sleep(1.0)
+                    continue
+
+                # 换了游戏进程(重开游戏) -> 重新计数
+                cur_pid = getattr(self.game, "pid", 0)
+                if cur_pid != getattr(self, "_pet_pid", 0):
+                    self._pet_pid = cur_pid
+                    self._pet_last = 0.0
+                    self._pet_press_cnt = 0
+
+                # 还没进地图(读不到人物) -> 别在登录界面狂按召唤键(这不是宠物判断, 是安全保护)
+                try:
+                    _p = self.game.get_player()
+                except Exception:
+                    _p = 0
+                if not _p:
+                    self.pet_state.configure(text="不存在", foreground="#888888")
+                    time.sleep(0.5)
+                    continue
+                # ================= 唯一的判断: 有没有活体 =================
+                pet = self.game.get_pet()
+                _have_now = pet is not None and pet.get("alive")
+                if _have_now != getattr(self, "_pet_have_log", None):
+                    self._pet_have_log = _have_now
+                    app_log("PET: 活体判定 -> %s (来源 %s)"
+                            % ("有" if _have_now else "无",
+                               getattr(self.game, "_pet_src", "?")))
+                if pet is not None and pet.get("alive"):
+                    # ---- 有活体 -> 只显示 存在 + 宝宝名字, 不按召唤键 ----
+                    self.pet_state.configure(text="存在", foreground="#009900")
+                    try:
+                        self.pet_info.configure(text="%s" % pet["name"])
+                    except Exception:
+                        pass
+                    time.sleep(1.0)
+                    continue
+
+                # ---- 没有活体(只有尸体 / 一只都没有) -> 只显示 不存在, 立刻召唤 ----
+                self.pet_state.configure(text="不存在", foreground="#CC0000")
+                try:
+                    self.pet_info.configure(text="--")
+                except Exception:
+                    pass
+
+                vk = self.VK_MAP.get(key)
+                if vk and (now - getattr(self, "_pet_last", 0.0)) >= interval / 1000.0:
+                    ok = self.game.press_key(vk, tag="召唤")
+                    if ok:
+                        self._pet_last = now
+                        self._pet_press_cnt = getattr(self, "_pet_press_cnt", 0) + 1
+                        if self._pet_press_cnt <= 3 or self._pet_press_cnt % 10 == 0:
+                            mode = getattr(self.game, "last_key_mode", "")
+                            mode_text = "大漠后台" if mode == "dm" else "普通键盘"
+                            app_log("PET: 不存在 -> 按 %s 第 %d 次 (%s)"
+                                    % (key, self._pet_press_cnt, mode_text))
+                    else:
+                        app_log("PET: 召唤按键失败 %s (%s)"
+                                % (key, getattr(self.game.dm_input, "_last_error", "")))
+            except Exception:
+                try:
+                    self.pet_state.configure(text="不存在", foreground="#CC0000")
+                except Exception:
+                    pass
+            time.sleep(1.0)
+
+    def status_text(self):
+        """状态栏文本: PID + 当前客户端(只显示, 不可切换)"""
+        dm_state = "开" if getattr(self.game.dm_input, "enabled", False) else "关"
+        if getattr(self.game, "pm", None) is None:
+            return "未绑定    大漠后台键鼠: %s" % dm_state
+        return "游戏 PID: %s    客户端: %s    大漠后台键鼠: %s" % (
+            self.game.pid, ACTIVE_CLIENT or "?", dm_state)
+
+    def toggle_dm_input(self):
+        enabled = bool(self.dm_enable_var.get())
+        self.game.dm_input.set_enabled(enabled)
+        app_log("[大漠] 后台键鼠%s" % ("启用" if enabled else "关闭"))
+        try:
+            self.dm_status_label.configure(
+                text="已启用，正在初始化" if enabled else "未启用",
+                foreground="#CC6600" if enabled else "#888888")
+        except Exception:
+            pass
+        try:
+            self.status_label.configure(text=self.status_text())
+        except Exception:
+            pass
+
+    def _dm_status(self, text, color="#888888"):
+        try:
+            self.dm_status_label.configure(text=text, foreground=color)
+        except Exception:
+            pass
+
+    def dm_save_config(self):
+        ok = self.game.dm_input.save_settings(
+            self.dm_reg_code_var.get().strip(),
+            self.dm_reg_extra_var.get().strip(),
+            self.dm_display_var.get().strip() or "gdi",
+            self.dm_mouse_var.get().strip() or "windows",
+            self.dm_keyboard_var.get().strip() or "windows",
+            enabled=bool(self.dm_enable_var.get()))
+        if ok:
+            self._dm_status("已保存", "#009900")
+            app_log("[大漠] 配置已保存")
+        else:
+            self._dm_status("保存失败", "#CC0000")
+            app_log("[大漠] 配置保存失败")
+
+    def dm_initialize(self):
+        code = self.dm_reg_code_var.get().strip()
+        extra = self.dm_reg_extra_var.get().strip()
+        display = self.dm_display_var.get().strip() or "gdi"
+        mouse = self.dm_mouse_var.get().strip() or "windows"
+        keyboard = self.dm_keyboard_var.get().strip() or "windows"
+        if not code:
+            messagebox.showwarning("大漠", "请先填写注册码", parent=self.root)
+            return
+        try:
+            self.dm_init_btn.configure(state="disabled", text="注册中…")
+        except Exception:
+            pass
+        self._dm_status("正在初始化并注册…", "#CC6600")
+
+        def work():
+            ok = self.game.dm_input.initialize_and_register(
+                code, extra, display, mouse, keyboard)
+
+            def done():
+                try:
+                    self.dm_init_btn.configure(state="normal", text="初始化并注册")
+                except Exception:
+                    pass
+                self.dm_enable_var.set(bool(self.game.dm_input.enabled))
+                if ok:
+                    self._dm_status("注册成功  V%s" % (self.game.dm_input.version or "?"),
+                                    "#009900")
+                    app_log("[大漠] 初始化并注册成功")
+                else:
+                    self._dm_status("注册失败: %s" % self.game.dm_input._last_error,
+                                    "#CC0000")
+                    app_log("[大漠] 初始化并注册失败: %s"
+                            % self.game.dm_input._last_error)
+                try:
+                    self.status_label.configure(text=self.status_text())
+                except Exception:
+                    pass
+            try:
+                self.root.after(0, done)
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def dm_bind_window(self):
+        pid = self.game.pid
+        hwnd = self.game._dm_window()
+        if not pid or not hwnd:
+            messagebox.showwarning(
+                "大漠绑定",
+                "没有可绑定窗口。请先用天昊助手准星拖拽绑定游戏窗口。",
+                parent=self.root)
+            return
+        try:
+            self.dm_bind_btn.configure(state="disabled", text="绑定中…")
+        except Exception:
+            pass
+        self._dm_status("正在绑定窗口 0x%X…" % hwnd, "#CC6600")
+
+        def work():
+            ok = self.game.dm_input.bind(pid, hwnd)
+
+            def done():
+                try:
+                    self.dm_bind_btn.configure(state="normal", text="绑定")
+                except Exception:
+                    pass
+                self.dm_enable_var.set(bool(self.game.dm_input.enabled))
+                if ok:
+                    self._dm_status("绑定成功  hwnd=0x%X" % hwnd, "#009900")
+                    try:
+                        self.dm_window_label.configure(
+                            text="窗口: 0x%X  PID: %s" % (hwnd, pid))
+                    except Exception:
+                        pass
+                    app_log("[大漠] 绑定窗口成功 hwnd=0x%X" % hwnd)
+                else:
+                    self._dm_status("绑定失败: %s" % self.game.dm_input._last_error,
+                                    "#CC0000")
+                    app_log("[大漠] 绑定窗口失败: %s"
+                            % self.game.dm_input._last_error)
+                try:
+                    self.status_label.configure(text=self.status_text())
+                except Exception:
+                    pass
+            try:
+                self.root.after(0, done)
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def dm_unbind_window(self):
+        self.game.dm_input.unbind()
+        self._dm_status("已解绑", "#888888")
+        try:
+            self.dm_window_label.configure(text="窗口: 当前游戏窗口")
+        except Exception:
+            pass
+        app_log("[大漠] 已解绑窗口")
+
+    def _make_crosshair_image(self, size=36):
+        """画一个准星图标(不用外部图片)"""
+        img = tk.PhotoImage(width=size, height=size)
+        img.put("#101010", to=(0, 0, size, size))
+        c = size // 2
+        for k in range(4, size - 4):          # 十字线
+            img.put("#00E676", to=(k, c - 1, k + 1, c + 1))
+            img.put("#00E676", to=(c - 1, k, c + 1, k + 1))
+        img.put("#00E676", to=(0, 0, size, 2))
+        img.put("#00E676", to=(0, size - 2, size, size))
+        img.put("#00E676", to=(0, 0, 2, size))
+        img.put("#00E676", to=(size - 2, 0, size, size))
+        img.put("#FF3B30", to=(c - 2, c - 2, c + 3, c + 3))   # 中心红点
+        return img
+
+    def _ensure_highlight(self):
+        """按住准星时, 给鼠标下面的窗口画一个红框(内部透明)"""
+        w = getattr(self, "_hl_win", None)
+        if w is not None:
+            return w
+        w = tk.Toplevel(self.root)
+        w.overrideredirect(True)
+        try:
+            w.attributes("-topmost", True)
+        except Exception:
+            pass
+        try:
+            w.attributes("-transparentcolor", "#FF00FF")   # 内部挖空
+        except Exception:
+            pass
+        w.configure(bg="#FF00FF")
+        for kw in (dict(x=0, y=0, relwidth=1.0, height=3),
+                   dict(x=0, rely=1.0, y=-3, relwidth=1.0, height=3),
+                   dict(x=0, y=0, width=3, relheight=1.0),
+                   dict(relx=1.0, x=-3, y=0, width=3, relheight=1.0)):
+            tk.Frame(w, bg="#FF3B30").place(**kw)
+        w.withdraw()
+        self._hl_win = w
+        return w
+
+    def _highlight_rect(self, rect):
+        x1, y1, x2, y2 = rect
+        if x2 <= x1 or y2 <= y1:
+            return self._hide_highlight()
+        w = self._ensure_highlight()
+        try:
+            w.geometry("%dx%d+%d+%d" % (x2 - x1, y2 - y1, x1, y1))
+            w.deiconify()
+            w.lift()
+        except Exception:
+            pass
+
+    def _hide_highlight(self):
+        w = getattr(self, "_hl_win", None)
+        if w is not None:
+            try:
+                w.withdraw()
+            except Exception:
+                pass
+
+    def _window_rect(self, hwnd):
+        try:
+            r = ctypes.wintypes.RECT()
+            ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(r))
+            return int(r.left), int(r.top), int(r.right), int(r.bottom)
+        except Exception:
+            return 0, 0, 0, 0
+
+    def _build_bind_drag(self, parent):
+        """工具栏里的拖拽准星: 按住它拖到目标窗口松手即绑定。
+
+        图标本体是普通控件(跟着主窗口移动/最小化), 拖动时另起一个"影子"图标跟着鼠标走,
+        松手后影子消失 —— 就是大漠那种手感。
+        """
+        self._cross_img = self._make_crosshair_image(22)
+        self.bind_drag_lbl = tk.Label(parent, image=self._cross_img, bd=0,
+                                      cursor="hand2")
+        self.bind_drag_lbl.pack(side="right", padx=(0, 6))
+        self.bind_drag_lbl.bind("<ButtonPress-1>", self._drag_bind_start)
+        self.bind_drag_lbl.bind("<B1-Motion>", self._drag_bind_move)
+        self.bind_drag_lbl.bind("<ButtonRelease-1>", self._drag_bind_drop)
+        self._ghost = None
+        self._dragging = False
+        self._cross_img_big = None
+
+    def _ghost_icon(self):
+        """拖动时跟着鼠标的影子图标(平时隐藏)"""
+        w = getattr(self, "_ghost", None)
+        if w is not None:
+            return w
+        w = tk.Toplevel(self.root)
+        w.overrideredirect(True)
+        try:
+            w.attributes("-topmost", True)
+        except Exception:
+            pass
+        if getattr(self, "_cross_img_big", None) is None:
+            self._cross_img_big = self._make_crosshair_image(36)
+        tk.Label(w, image=self._cross_img_big, bd=0, bg="#101010").pack()
+        w.withdraw()
+        self._ghost = w
+        return w
+
+    def _drag_bind_start(self, ev):
+        self._dragging = True
+        w = self._ghost_icon()
+        try:
+            w.geometry("+%d+%d" % (ev.x_root + 18, ev.y_root + 18))
+            w.deiconify()
+            w.lift()
+        except Exception:
+            pass
+
+    def _drag_bind_move(self, ev):
+        w = getattr(self, "_ghost", None)
+        if w is not None:
+            try:
+                w.geometry("+%d+%d" % (ev.x_root + 18, ev.y_root + 18))
+            except Exception:
+                pass
+        hwnd, _pid = self._window_under_cursor()
+        if hwnd:
+            self._highlight_rect(self._window_rect(hwnd))
+        else:
+            self._hide_highlight()
+
+    def _drag_bind_drop(self, ev):
+        self._dragging = False
+        w = getattr(self, "_ghost", None)
+        if w is not None:
+            try:
+                w.withdraw()
+            except Exception:
+                pass
+        self._hide_highlight()
+        self.bind_window_under_cursor()
+
+    def _window_under_cursor(self):
+        """鼠标下那个窗口的顶层 hwnd + pid"""
+        try:
+            u32 = ctypes.windll.user32
+            u32.WindowFromPoint.restype = ctypes.wintypes.HWND
+            u32.WindowFromPoint.argtypes = [ctypes.wintypes.POINT]
+            u32.GetAncestor.restype = ctypes.wintypes.HWND
+            u32.GetAncestor.argtypes = [ctypes.wintypes.HWND, ctypes.wintypes.UINT]
+            pt = ctypes.wintypes.POINT()
+            u32.GetCursorPos(ctypes.byref(pt))
+            hwnd = u32.WindowFromPoint(pt)
+            if not hwnd:
+                return 0, 0
+            root = u32.GetAncestor(hwnd, 2) or hwnd      # GA_ROOT
+            pid = ctypes.wintypes.DWORD(0)
+            u32.GetWindowThreadProcessId(root, ctypes.byref(pid))
+            return int(root), int(pid.value)
+        except Exception:
+            return 0, 0
+
+    def bind_window_under_cursor(self):
+        """拖拽松手: 取鼠标下的窗口 -> 找同名客户端配置 -> 绑定该进程"""
+        hwnd, pid = self._window_under_cursor()
+        if not pid:
+            app_log("[绑定] 没取到鼠标下的窗口")
+            return False
+        if pid == os.getpid():
+            app_log("[绑定] 松手落在辅助自己窗口上了")
+            return False
+        name = ""
+        try:
+            for proc in pymem.process.list_processes():
+                p = getattr(proc, "pid", None) or getattr(proc, "th32ProcessID", None)
+                if p and int(p) == pid:
+                    n = getattr(proc, "szExeFile", None) or getattr(proc, "name", None)
+                    if isinstance(n, bytes):
+                        n = n.decode("mbcs", "ignore")
+                    name = n or ""
+                    break
+        except Exception:
+            pass
+
+        # 客户端由用户在【客户端】下拉框手动选择, 拖拽绑定只记名字, 不自动改配置
+        try:
+            app_log("[绑定] 拖拽到进程: %s" % (name or "?"))
+        except Exception:
+            pass
+
+        try:
+            profs = load_client_profiles()
+            cid = _detect_profile_by_memory(
+                profs, [SimpleNamespace(pid=pid, name=name)], ACTIVE_CLIENT)
+            if cid and cid != ACTIVE_CLIENT:
+                apply_client_profile(profs[cid])
+                set_active_client(cid)
+                app_log("[绑定] 按内存特征切换配置: %s" % cid)
+            elif not cid:
+                app_log("[绑定] 内存特征未匹配配置, 沿用: %s" % ACTIVE_CLIENT)
+            self.game.attach_pid(pid, name)
+        except Exception as exc:
+            try:
+                messagebox.showwarning(
+                    "拖拽绑定",
+                    "绑定 PID %d (%s) 失败：\n%s\n\n请对着游戏画面松手，并用管理员运行本程序。"
+                    % (pid, name or "未知", exc), parent=self.root)
+            except Exception:
+                pass
+            app_log("[绑定] 拖拽绑定失败: %s" % exc)
+            return False
+        app_log("[绑定] 拖拽绑定 OK: PID=%s %s" % (pid, name or ""))
+        self._refresh_bound_ui()
+        return True
+
+
+
+
+    def _refresh_bound_ui(self):
+        try:
+            if hasattr(self, "status_label"):
+                self.status_label.configure(text=self.status_text())
+        except Exception:
+            pass
+
+
+    def unbind(self):
+        """解绑: 断开与游戏的连接(不关游戏, 客户端下拉框保持不动)"""
+        try:
+            if getattr(self, "guaji", False):
+                self.toggle_guaji()          # 先停挂机, 免得线程还在读内存
+        except Exception:
+            pass
+        try:
+            self.game.detach()
+        except Exception:
+            pass
+        try:
+            self.game.dm_input.unbind()
+        except Exception:
+            pass
+        try:
+            self.game.dm_input.close()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "dm_window_label"):
+                self.dm_window_label.configure(text="窗口: 当前游戏窗口")
+            if hasattr(self, "dm_status_label"):
+                self._dm_status("已解绑", "#888888")
+        except Exception:
+            pass
+        app_log("[绑定] 已解绑")
+        try:
+            self.status_label.configure(text=self.status_text())
+        except Exception:
+            pass
+        try:
+            self.count_label.configure(text="怪物数量：0")
+            self._refresh_unified_state()
+            self.tree.delete(*self.tree.get_children())
+        except Exception:
+            pass
+
+
+
+
+
+    def update_button_text(self):
+        if self.auto_attack:
+            self.attack_button.configure(text="停止攻击")
+        else:
+            self.attack_button.configure(text="自动攻击")
+
+    def _refresh_unified_state(self):
+        if not hasattr(self, "target_label"):
+            return
+        if getattr(self.game, "pm", None) is None:
+            text = "状态：未绑定"
+            color = "#888888"
+        elif not getattr(self, "guaji", False):
+            text = "状态：未开始挂机"
+            color = "#888888"
+        else:
+            pick_text = ""
+            try:
+                pick_text = self.pick_state.cget("text").strip()
+            except Exception:
+                pass
+            target_text = str(getattr(self, "target_text", "") or "").strip()
+            pick_active = pick_text.startswith((
+                "去捡", "等捡", "等掉落", "捡不起", "到不了", "跳过", "捡物错误"))
+            notice_text = str(getattr(self, "_combat_notice_text", "") or "").strip()
+            notice_active = (notice_text
+                             and time.time() < getattr(self, "_combat_notice_until", 0.0))
+            if (pick_active
+                    and (getattr(self, "_loot_pending", False)
+                         or getattr(self, "auto_pickup", False))):
+                text = "等捡物：" + pick_text
+                color = "#009900"
+            elif getattr(self, "auto_attack", False) and notice_active:
+                text = "打怪中：" + notice_text
+                color = "#CC6600"
+            elif (getattr(self, "auto_attack", False)
+                  and getattr(self, "_cur_actor", 0)):
+                text = "打怪中：" + (target_text or "怪物")
+                color = "#CC6600"
+            elif (getattr(self, "auto_route", False)
+                  and getattr(self, "route_points", None)):
+                _has_mon = self._ui_has_monsters()
+                if _has_mon:
+                    text = "有怪物，停止寻路" if not getattr(self, "auto_attack", False) else "有怪物，等待打怪"
+                    color = "#CC6600"
+                else:
+                    idx = int(getattr(self, "route_idx", 0) or 0)
+                    if idx < 0 or idx >= len(self.route_points):
+                        idx = 0
+                    tx, ty = self.route_points[idx]
+                    text = "无怪物，寻路去 (%d,%d)" % (int(tx), int(ty))
+                    color = "#0066CC"
+            elif target_text and target_text not in ("无", "附近没有怪物"):
+                text = "状态：" + target_text
+                color = "#0066CC"
+            else:
+                text = "无怪物"
+                color = "#888888"
+        try:
+            self.target_label.configure(text=text, foreground=color)
+        except Exception:
+            pass
+
+    # ---------------- 状态/掉线日志 ----------------
+    def watchdog_loop(self):
+        last_ok = None      # None=还没读到过 (登录中), True=正常, False=掉线
+        tick = 0
+        while True:
+            try:
+                tick += 1
+                if getattr(self.game, "pm", None) is None:
+                    # 未绑定 / 已解绑: 这不是掉线, 不要记日志
+                    # (否则每次点【解绑】都会刷一条"[掉线] 读不到人物对象 (pid=None)")
+                    last_ok = None
+                    time.sleep(5)
+                    continue
+                pid = getattr(self.game, "pid", "?")
+                p = 0
+                try:
+                    p = self.game.get_player()
+                except Exception:
+                    p = 0
+                if not p:
+                    if last_ok is True:
+                        app_log("[\u6389\u7ebf] \u8bfb\u4e0d\u5230\u4eba\u7269\u5bf9\u8c61 (pid=%s) | attack=%s route=%s idx=%s" % (
+                            pid,
+                            getattr(self, "auto_attack", False),
+                            getattr(self, "auto_route", False),
+                            getattr(self, "route_idx", -1)))
+                    elif last_ok is None and tick % 6 == 0:
+                        app_log("[\u7b49\u5f85] \u8fd8\u6ca1\u8bfb\u5230\u4eba\u7269 (pid=%s, \u53ef\u80fd\u8fd8\u5728\u767b\u5f55\u754c\u9762)" % pid)
+                    last_ok = False
+                else:
+                    x, y = self.game.get_player_pos()
+                    hp, mx = self.game.get_player_hp()
+                    if last_ok is not True:
+                        app_log("[\u8fde\u63a5] \u8bfb\u5230\u4eba\u7269 pid=%s ptr=%X pos=(%d,%d)" % (pid, p, x, y))
+                    last_ok = True
+                    if tick % 2 == 0:
+                        app_log("[\u72b6\u6001] pid=%s ptr=%X pos=(%d,%d) hp=%s/%s attack=%s route=%s idx=%s" % (
+                            pid, p, x, y, hp, mx,
+                            getattr(self, "auto_attack", False),
+                            getattr(self, "auto_route", False),
+                            getattr(self, "route_idx", -1)))
+            except Exception as e:
+                if last_ok is True:
+                    app_log("[\u5f02\u5e38] %s" % e)
+                last_ok = False
+            time.sleep(5)
+
+    def _sync_guaji_features(self):
+        """按【是否挂机中】+ 各功能【启用】勾选, 统一起/停各功能。
+
+        某一个功能"该跑"的条件 = 挂机中 且 该功能勾了"启用"。
+        没勾"启用"的, 挂机也不会开它。
+        """
+        g = bool(getattr(self, "guaji", False))
+        pairs = (
+            ("auto_hp", "hp_enable", self.toggle_auto_hp),
+            ("auto_skill", "skill_enable", self.toggle_auto_skill),
+            ("auto_pet", "pet_enable", self.toggle_auto_pet),
+            ("auto_pickup", "pickup_enable", self.toggle_auto_pickup),
+            ("auto_attack", "attack_enable", self.toggle_auto_attack),
+            ("auto_route", "route_enable", self.toggle_route),
+        )
+        for run_attr, en_attr, fn in pairs:
+            var = getattr(self, en_attr, None)
+            want = g and (bool(var.get()) if var is not None else True)
+            if bool(getattr(self, run_attr, False)) != want:
+                try:
+                    fn()
+                except Exception:
+                    pass
+        try:
+            self.update_button_text()
+        except Exception:
+            pass
+
+    def toggle_guaji(self):
+        """总开关: 开始/停止挂机。
+
+        开始: 不立即执行, 先延迟 GUAJI_START_DELAY_SEC 秒(留给用户切回游戏窗口),
+              时间到才真正开始扫描 + 运行【启用】的功能。
+              倒计时期间再点一次 = 取消。
+        停止: 立即全停 + 停止扫描。
+        """
+        if getattr(self, "_guaji_arm", False):
+            self._guaji_arm = False
+            try:
+                self.guaji_btn.configure(text="开始挂机")
+            except Exception:
+                pass
+            app_log("[挂机] 取消")
+            return
+        if not getattr(self, "guaji", False):
+            # 还没绑定游戏就别开始: 提示怎么绑
+            if getattr(self.game, "pm", None) is None:
+                try:
+                    messagebox.showwarning(
+                        "还没绑定游戏",
+                        "现在没有绑定游戏进程。\n\n"
+                        "请把工具栏上的准星图标【拖到游戏窗口上】松手。\n"
+                        "（没绑上时点开始挂机不会做任何事）", parent=self.root)
+                except Exception:
+                    pass
+                return
+            self._guaji_arm = True
+            self._guaji_click_at = time.time()   # 记下"点开始挂机"的时刻(宠物延迟从这里算)
+            try:
+                self.guaji_btn.configure(
+                    text="准备中 %ds\u2026" % int(GUAJI_START_DELAY_SEC))
+            except Exception:
+                pass
+            app_log("[挂机] 准备中(%ds)\u2026" % int(GUAJI_START_DELAY_SEC))
+            self.root.after(int(GUAJI_START_DELAY_SEC * 1000), self._guaji_start_now)
+        else:
+            self._guaji_stop_now()
+
+    def _guaji_start_now(self):
+        if not getattr(self, "_guaji_arm", False):
+            return
+        self._guaji_arm = False
+        self.guaji = True
+        try:
+            self.guaji_btn.configure(text="停止挂机")
+        except Exception:
+            pass
+        self._sync_guaji_features()
+        app_log("[挂机] 开始")
+
+    def _guaji_stop_now(self):
+        self._guaji_arm = False
+        self.guaji = False
+        try:
+            self.guaji_btn.configure(text="开始挂机")
+        except Exception:
+            pass
+        self._sync_guaji_features()
+        # stop: interrupt movement + clear target + clear scan cache
+        self._move_release()
+        try:
+            self.game.clear_attack_target()
+        except Exception:
+            pass
+        # 清攻击/卡位等缓存, 下次开始重新判定
+        try:
+            self._dead = {}
+            self._cur_actor = 0
+            self._stuck_skip = set()
+            self._stuck_until = {}
+            self._cur_lock_until = 0.0
+            self._cur_set_at = 0.0
+            self._dmg_at = 0.0
+            self._stuck_count = {}
+            self._hp_seen = {}
+            self._hp_all = {}
+            self._others_fight = {}
+            self._avoid_players_active = False
+            self._avoid_clear_since = 0.0
+            self._avoid_route_forced = False
+            self.target_text = "无"
+            self._pick_paused_by_weight = False
+            self._pick_pause_reason = ""
+        except Exception:
+            pass
+        # 清空界面上的怪物/物品列表(下次开始重新扫描)
+        for _attr in ("tree", "item_tree"):
+            try:
+                _w = getattr(self, _attr, None)
+                if _w is not None:
+                    for _it in _w.get_children():
+                        _w.delete(_it)
+            except Exception:
+                pass
+        try:
+            if hasattr(self, "count_label"):
+                self.count_label.configure(text="怪物数量：--（未开始挂机）")
+            self._refresh_unified_state()
+        except Exception:
+            pass
+        app_log("[挂机] 停止")
+
+    def toggle_auto_attack(self):
+        self.auto_attack = not self.auto_attack
+        app_log("[\u81ea\u52a8\u653b\u51fb] %s" % ("\u5f00\u542f" if self.auto_attack else "\u505c\u6b62"))
+        if self.auto_attack:
+            if self.attack_thread is None or not self.attack_thread.is_alive():
+                self.attack_thread = threading.Thread(target=self.attack_loop, daemon=True)
+                self.attack_thread.start()
+        else:
+            try:
+                self.game.clear_attack_target()
+            except Exception:
+                pass
+            self._move_finish_attack()
+        self.update_button_text()
+
+    def attack_loop(self):
+        # 自己维护"已确认死亡"的怪(客户端怪物血量只在选中时才同步)
+        if not hasattr(self, "_dead") or not isinstance(self._dead, dict):
+            self._dead = dict.fromkeys(getattr(self, "_dead", ()) or (), time.time())
+        if not hasattr(self, "_cur_actor"):
+            self._cur_actor = 0
+        if not hasattr(self, "_cur_set_at"):
+            self._cur_set_at = 0.0
+        if not hasattr(self, "_dmg_at"):
+            self._dmg_at = 0.0
+        if not hasattr(self, "_stuck_skip"):
+            self._stuck_skip = set()
+        if not hasattr(self, "_stuck_count"):
+            self._stuck_count = {}
+        if not hasattr(self, "_hp_seen"):
+            self._hp_seen = {}
+        if not hasattr(self, "_hp_all"):
+            self._hp_all = {}
+        if not hasattr(self, "_others_fight") or not isinstance(self._others_fight, dict):
+            self._others_fight = {}
+        if not hasattr(self, "_avoid_players_active"):
+            self._avoid_players_active = False
+        if not hasattr(self, "_avoid_clear_since"):
+            self._avoid_clear_since = 0.0
+        if not hasattr(self, "_avoid_route_forced"):
+            self._avoid_route_forced = False
+        self._stuck_actor = 0
+        self._stuck_dist = None
+        self._stuck_since = time.time()
+        self._nohp_actor = 0
+        self._nohp_hp = 0
+        self._nohp_since = time.time()
+        self._no_target_since = 0.0
+        self._stuck_until = {}          # {actor: 解禁时间} 卡位黑名单带时间
+        self._cur_lock_until = 0.0      # 刚换过目标 -> 这段时间内不再换
+        self._pos_last = None           # 上一次人物坐标
+        self._pos_since = time.time()   # 人物从什么时候开始原地没动
+        self._best_actor = 0            # 卡位检测: 当前目标
+        self._best_dist = None          # 到这个目标"见过的最好(最小)距离"
+        self._best_since = time.time()  # 上一次刷新"最好距离"的时间
+        while self.auto_attack:
+            cur = None
+            try:
+                if time.time() < getattr(self, "_attack_hold_until", 0.0):
+                    self.target_text = "停车中，等待移动停止"
+                    time.sleep(0.05)
+                    continue
+                mons = self.game.get_actors()
+                if getattr(self.game, "_actor_lookup_failed", False):
+                    # 这一轮没反查到 Actor 数组(数组被重分配) -> 直接跳过,
+                    # 不要清空当前目标, 也不要喊"附近没有怪物"
+                    time.sleep(0.7)
+                    continue
+                by_ptr = {m["actor"]: m for m in mons}
+                live = set(by_ptr.keys())
+
+                # (a) 清理: 死亡名单/计数 按"还在不在 actor 列表"清;
+                #     卡位黑名单**按时间**清 —— 以前写成 &= live, 怪一走出视野就从名单掉了,
+                #     回来又被选中 -> 人就在两只怪之间来回徘徊(看起来像外挂)。
+                # 死亡名单 = {对象地址: 判死时间}
+                #   ① 不在 actor 列表了 -> 删
+                #   ② 超过 AUTO_ATTACK_DEAD_FORGET_SEC -> 删(防挂机僵尸会原地复活, 不能永久拉黑)
+                _now_d = time.time()
+                if not isinstance(self._dead, dict):
+                    self._dead = dict.fromkeys(self._dead or (), _now_d)
+                self._dead = {a: t for a, t in self._dead.items()
+                              if a in live and (_now_d - t) < AUTO_ATTACK_DEAD_FORGET_SEC}
+                # 血又回来了(复活) -> 立刻放出来, 不用等超时
+                for _m in mons:
+                    if not self._is_corpse(_m) or (_m.get("hp") or 0) > 0:
+                        self._dead.pop(_m.get("actor"), None)
+                _now_a = time.time()
+                for _a in [a for a, t in self._stuck_until.items() if t <= _now_a]:
+                    self._stuck_until.pop(_a, None)
+                    self._stuck_skip.discard(_a)
+                for _a in [k for k in self._stuck_count if k not in live]:
+                    del self._stuck_count[_a]
+                for _a in [k for k in self._hp_seen if k not in live]:
+                    del self._hp_seen[_a]
+
+                # 贴着人物的怪(它自己走过来打的): 卡位判定/卡位黑名单一律作废, 立刻放出来打
+                #   ① 已在卡位黑名单里的(_stuck_skip) -> 解除黑名单
+                #   ② 只被判过一次、还没进黑名单的(_stuck_count) -> 计数清零, 免得马上又被判第 2 次拉黑
+                if AUTO_ATTACK_CLOSE_FORCE > 0 and (self._stuck_skip or self._stuck_count):
+                    try:
+                        _fx, _fy = self.game.get_player_pos()
+                    except Exception:
+                        _fx = _fy = None
+                    if _fx is not None:
+                        for _m in mons:
+                            _a = _m.get("actor") or 0
+                            if not _a or (_a not in self._stuck_skip and _a not in self._stuck_count):
+                                continue
+                            if max(abs(_m["x"] - _fx), abs(_m["y"] - _fy)) <= AUTO_ATTACK_CLOSE_FORCE:
+                                _in_black = _a in self._stuck_skip
+                                self._stuck_skip.discard(_a)
+                                self._stuck_until.pop(_a, None)
+                                self._stuck_count.pop(_a, None)
+                                app_log("[打怪] %s 自己贴上来(<=%d格) -> %s, 打它"
+                                        % (_m.get("name", "?"), AUTO_ATTACK_CLOSE_FORCE,
+                                           "解除卡位黑名单" if _in_black else "清掉卡位计数"))
+
+                # (a2) 有人就闪: 屏幕里出现别的玩家 -> 立刻放弃打怪, 去寻路; 人走了再打
+                _avoid_block = False
+                if AVOID_PLAYERS:
+                    try:
+                        _px0, _py0 = self.game.get_player_pos()
+                    except Exception:
+                        _px0 = _py0 = 0
+                    _near = []
+                    try:
+                        for _o in self.game.other_players():
+                            _ox = int(_o.get("x") or 0)
+                            _oy = int(_o.get("y") or 0)
+                            if max(abs(_ox - _px0), abs(_oy - _py0)) <= AVOID_PLAYER_DIST:
+                                _near.append(_o)
+                    except Exception:
+                        _near = []
+                    if _near:
+                        self._avoid_clear_since = 0.0
+                        _avoid_block = True
+                        # 突然冒出来 -> 立刻放弃当前目标(停攻击)
+                        if self._cur_actor:
+                            self._cur_actor = 0
+                            try:
+                                self.game.clear_attack_target()
+                            except Exception:
+                                pass
+                        if getattr(self, "_move_state", "") == MOVE_STATE_PICKUP:
+                            self._move_release("pick")
+                        _nm = ", ".join(str(o.get("name") or "?") for o in _near[:3])
+                        self.target_text = "有人(%s) -> 放弃打怪去寻路" % _nm
+                        if not self._avoid_players_active:
+                            self._avoid_players_active = True
+                            app_log("[有人就闪] 屏幕出现玩家 %s -> 放弃打怪, 开始寻路" % _nm)
+                            if not getattr(self, "auto_route", False):
+                                try:
+                                    self.toggle_route()
+                                    self._avoid_route_forced = True
+                                except Exception:
+                                    pass
+                            # 路线点是空的时候 toggle_route 会自己拒绝启动 -> 明确说一声,
+                            # 否则表现就是"不打怪也不走路"站着发呆
+                            if not getattr(self, "auto_route", False):
+                                app_log("[有人就闪] 没有路线点, 寻路起不来(先去【寻路】页添加坐标)")
+                    elif self._avoid_players_active:
+                        # 人走了: 再等 AVOID_PLAYER_CLEAR_SEC 秒(防在边界反复横跳)再恢复
+                        if not self._avoid_clear_since:
+                            self._avoid_clear_since = time.time()
+                        elif (time.time() - self._avoid_clear_since) >= AVOID_PLAYER_CLEAR_SEC:
+                            self._avoid_players_active = False
+                            app_log("[有人就闪] 屏幕已无其他玩家 -> 恢复打怪")
+                            if getattr(self, "_avoid_route_forced", False):
+                                self._avoid_route_forced = False
+                                try:
+                                    self.toggle_route()
+                                except Exception:
+                                    pass
+
+                # (a3) 别人在打的怪: 我们没打它, 它的血却掉了 -> 有人在抢, 记下来先不碰
+                _now_o = time.time()
+                self._others_fight = {a: t for a, t in self._others_fight.items() if t > _now_o}
+                if NO_STEAL and AUTO_ATTACK_OTHERS_SEC > 0:
+                    for _m in mons:
+                        _a = _m.get("actor") or 0
+                        _mx = _m.get("max_hp") or 0
+                        _hp = _m.get("hp") or 0
+                        if not _a or not (_mx > 0 and _hp > 0):
+                            continue
+                        _prev = self._hp_all.get(_a)
+                        self._hp_all[_a] = _hp
+                        # 当前目标掉血 = 我们打的; 别人打的目标才记
+                        if _a == self._cur_actor or _prev is None or _hp >= _prev:
+                            continue
+                        _already = _a in self._others_fight
+                        self._others_fight[_a] = _now_o + AUTO_ATTACK_OTHERS_SEC
+                        if not _already:
+                            app_log("[打怪] %s 血自己掉了(%d->%d) -> 判定有人在打, 跳过 %.0f 秒"
+                                    % (_m.get("name", "?"), _prev, _hp, AUTO_ATTACK_OTHERS_SEC))
+                    for _a in [k for k in self._hp_all if k not in live]:
+                        del self._hp_all[_a]
+
+                # (b) 当前目标: 血量读到 0 -> 判定死亡(尸体)
+                if self._cur_actor:
+                    cur = by_ptr.get(self._cur_actor)
+                    if cur is None:
+                        # 本客户端怪物血常读 0/0, 死亡多半表现为"对象直接从 ActorList 消失";
+                        # 这条路以前不设 _loot_pending -> 人立刻扑下一只, 掉落物就捡不到了
+                        if getattr(self, "auto_pickup", False) and self._cur_actor:
+                            self._loot_pending = True
+                            self._loot_from = time.time()
+                        if RHYTHM_TRACE and self._cur_actor:
+                            self._rhythm = {"kill": time.time(), "who": "目标消失",
+                                            "loot_start": 0.0, "loot_end": 0.0, "next": 0.0}
+                            app_log("[节奏] 目标从列表消失(判定已死) -> 开始等捡物")
+                        self._loot_scans = 0
+                        self._cur_actor = 0
+                    elif self._is_corpse(cur):
+                        self._dead[self._cur_actor] = time.time()
+                        self._cur_actor = 0
+                        self.target_text = "{} 已死亡".format(cur.get("name", "?"))
+                        if RHYTHM_TRACE:
+                            self._rhythm = {"kill": time.time(), "who": cur.get("name", "?"),
+                                            "loot_start": 0.0, "loot_end": 0.0, "next": 0.0}
+                            app_log("[节奏] 打死 %s -> 开始等捡物" % cur.get("name", "?"))
+                        self._loot_scans = 0
+                        # 开了自动捡物 -> 先别急着扑下一只, 留时间把刚爆的东西捡了
+                        if getattr(self, "auto_pickup", False):
+                            self._loot_pending = True
+                            self._loot_from = time.time()
+
+                # 真的打到了(掉血) -> 清掉它的卡位计数
+                if self._cur_actor and cur:
+                    hp_now = cur.get("hp") or 0
+                    hp_old = self._hp_seen.get(self._cur_actor)
+                    if hp_old is not None and 0 < hp_now < hp_old:
+                        self._stuck_count.pop(self._cur_actor, None)
+                        self._stuck_skip.discard(self._cur_actor)
+                        self._dmg_at = time.time()      # 刚打到它(掉血了) -> 记一笔给卡位检测用
+                    if hp_now:
+                        self._hp_seen[self._cur_actor] = hp_now
+
+                if not self._cur_actor and getattr(self, "_move_state", "") == MOVE_STATE_ATTACK:
+                    self._move_finish_attack()
+
+                # (c) 没有当前目标 -> 挑怪
+                #     刚打死怪时先等自动捡物把东西收了(捡完 / 超时 才继续),
+                #     否则人已经扑向下一只, 爆的东西还在原地, 根本捡不到。
+                _loot_wait = (getattr(self, "auto_pickup", False)
+                              and getattr(self, "_loot_pending", False)
+                              and (time.time() - getattr(self, "_loot_from", 0)) < LOOT_PAUSE_SEC)
+                if _loot_wait:
+                    self.target_text = "等捡物…"
+                elif _avoid_block:
+                    pass          # 屏幕里有别的玩家 -> 不打怪(交给寻路把人带走)
+                elif not self._cur_actor:
+                    cands = [m for m in mons
+                             if m["actor"] not in self._dead
+                             and m["actor"] not in self._stuck_skip
+                             and m["actor"] not in self._others_fight     # 别人在打的怪不抢
+                             and not self._is_corpse(m)            # 尸体不当新目标
+                             and self._mon_name_ok(m.get("name", ""))]   # 只打/不打 过滤
+                    # 注意: 这里【不能】"全部拉黑就清空重来"。
+                    # 那样会让卡位名单反复失效 —— 几个都卡住的怪会在名单里
+                    # 进进出出, 永远在原地打转。
+                    # 全拉黑时就是没人可打(_cur_actor=0), 交给自动寻路把人带走;
+                    # 怪一旦离开 16 格就掉出 ActorList, 名单里也会跟着自动清掉。
+                    if cands:
+                        try:
+                            _px, _py = self.game.get_player_pos()
+                        except Exception:
+                            _px = _py = 0
+                        cands.sort(key=lambda m: (self._stuck_count.get(m["actor"], 0),
+                                                  max(abs(m["x"] - _px), abs(m["y"] - _py))))
+                        self._cur_actor = cands[0]["actor"]
+                        if RHYTHM_TRACE:
+                            _r = getattr(self, "_rhythm", None)
+                            if _r and _r.get("kill") and not _r.get("next"):
+                                _r["next"] = time.time()
+                                app_log("[节奏] 开始打下一只 %s (距上次打死 %.1f 秒)"
+                                        % (cands[0].get("name", "?"), _r["next"] - _r["kill"]))
+                        self._cur_set_at = time.time()      # 本目标开始时间(给 AUTO_ATTACK_MAX_SEC 用)
+                        self._dmg_at = 0.0                  # 新目标: 清掉上个目标的"打到过"时间
+                        self._no_target_since = 0.0
+                        # 换目标后锁 3.0~4.2 秒: 这期间不因"卡位/不掉血"再换
+                        # (避免卡一下就连着换、在两只怪之间来回走)
+                        self._cur_lock_until = (time.time() + AUTO_ATTACK_SWITCH_LOCK
+                                                + (self._cur_actor % 7) * 0.2)
+                # (d) 交给游戏攻击目标处理接近与攻击，不再单独下发打怪移动
+                cur = by_ptr.get(self._cur_actor) if self._cur_actor else None
+                if self._cur_actor:
+                    if cur:
+                        self._move_begin_attack()
+                        self.game.set_attack_target(self._cur_actor)
+                        hp_txt = ("%s/%s" % (cur["hp"], cur["max_hp"])
+                                  if (cur["hp"] or cur["max_hp"]) else "?")
+                        self.target_text = "{} ({},{}) {}  ptr={:X}".format(
+                            cur["name"], cur["x"], cur["y"], hp_txt, self._cur_actor)
+                    else:
+                        self._cur_actor = 0
+                else:
+                    # 不要一拍没目标就喊"附近没有怪物": 尸体同步/数组重分配都会有一拍空数据
+                    if not self._no_target_since:
+                        self._no_target_since = time.time()
+                    elif time.time() - self._no_target_since >= 1.5:
+                        self.target_text = "附近没有怪物"
+
+                # (e0) 原地不动(快判): 人物坐标连续 AUTO_ATTACK_STAND_SEC(=3) 秒没变、且离目标还远
+                #      -> 人物被障碍物挡死, 不用等 5 秒, 直接判卡位
+                if self._cur_actor and cur:
+                    try:
+                        _sx, _sy = self.game.get_player_pos()
+                    except Exception:
+                        _sx = _sy = None
+                    if _sx is not None:
+                        _sd = max(abs(cur["x"] - _sx), abs(cur["y"] - _sy))
+                        if self._pos_last == (_sx, _sy):
+                            if (_sd > AUTO_ATTACK_NEAR
+                                    and (time.time() - self._pos_since) >= AUTO_ATTACK_STAND_SEC
+                                    # 最近打到过它(掉血) -> 不算卡位: 站着不动也能打, 别白换目标
+                                    and (time.time() - getattr(self, "_dmg_at", 0.0)) >= AUTO_ATTACK_DMG_GRACE
+                                    and time.time() >= self._cur_lock_until):
+                                _nm = cur.get("name", "?")
+                                n = self._stuck_count.get(self._cur_actor, 0) + 1
+                                self._stuck_count[self._cur_actor] = n
+                                if n >= 2:
+                                    self._stuck_skip.add(self._cur_actor)
+                                    self._stuck_until[self._cur_actor] = time.time() + AUTO_ATTACK_BLACK_SEC
+                                    self.target_text = "{} 被挡{}次→拉入卡位名单".format(_nm, n)
+                                else:
+                                    self.target_text = "{} 被挡住{}秒→换目标".format(_nm, int(AUTO_ATTACK_STAND_SEC))
+                                    app_log("[打怪] %s" % self.target_text)
+                                self._cur_actor = 0
+                                self._best_actor = 0
+                                self._best_dist = None
+                                self._pos_last = None
+                        else:
+                            self._pos_last = (_sx, _sy)
+                            self._pos_since = time.time()
+
+                # (e) 卡位检测(统一): 到目标的距离在 AUTO_ATTACK_STUCK_SEC 秒内**没有任何实质接近**
+                #     一次覆盖两种卡位:
+                #       ① 人物被挡住, 原地不动
+                #       ② 人物在障碍物旁边来回蹭(距离一直在变, 但始终没更近)
+                #     判据 = "历史最好(最小)距离": 只要没比它再近 1 格以上, 就算没进展。
+                #     来回徘徊时 best 不变 -> 照样判得出来(旧逻辑只判"距离有没有变", 这种情况永远判不出);
+                #     正常靠近时 best 不断刷新 -> 计时一直重置, 不会误判。
+                if self._cur_actor and cur:
+                    try:
+                        px, py = self.game.get_player_pos()
+                    except Exception:
+                        px = py = None
+                    if px is not None:
+                        dist = max(abs(cur["x"] - px), abs(cur["y"] - py))
+                        _now_e = time.time()
+                        if dist <= AUTO_ATTACK_NEAR:
+                            # 已贴身 -> 清空卡位计时(交给 (f) 不掉血检测)
+                            self._best_actor = 0
+                            self._best_dist = None
+                        elif (self._best_actor != self._cur_actor
+                              or self._best_dist is None):
+                            self._best_actor = self._cur_actor
+                            self._best_dist = dist
+                            self._best_since = _now_e
+                        elif dist <= self._best_dist - 1:
+                            # 比历史最好还近了 >=1 格 -> 确实在靠近, 重新计时
+                            self._best_dist = dist
+                            self._best_since = _now_e
+                        elif (_now_e - self._best_since >= AUTO_ATTACK_STUCK_SEC
+                              # 最近打到过它 -> 不判卡位(够得着, 只是没走得更近)
+                              and (_now_e - getattr(self, "_dmg_at", 0.0)) >= AUTO_ATTACK_DMG_GRACE
+                              and _now_e >= self._cur_lock_until):
+                            _nm = cur.get("name", "?")
+                            n = self._stuck_count.get(self._cur_actor, 0) + 1
+                            self._stuck_count[self._cur_actor] = n
+                            if n >= 2:
+                                self._stuck_skip.add(self._cur_actor)
+                                self._stuck_until[self._cur_actor] = _now_e + AUTO_ATTACK_BLACK_SEC
+                                self.target_text = "{} 卡位第{}次→拉入卡位名单".format(_nm, n)
+                            else:
+                                self.target_text = "{} 卡位第{}次→换目标".format(_nm, n)
+                                app_log("[打怪] %s" % self.target_text)
+                            self._cur_actor = 0
+                            self._best_actor = 0
+                            self._best_dist = None
+
+                # (f) 不掉血检测: 贴身(<=AUTO_ATTACK_NEAR 格)连续 AUTO_ATTACK_NOHP_SEC 秒
+                #     一点血都没掉 -> 认定打不到(招牌NPC/假目标), 换目标; 再犯拉进卡位名单。
+                #     真怪被打中会掉血 -> 计时自动清零, 不会误伤。
+                if self._cur_actor and cur:
+                    try:
+                        try:
+                            _px2, _py2 = self.game.get_player_pos()
+                        except Exception:
+                            _px2 = _py2 = None
+                        _hp_now = cur.get("hp") or 0
+                        _mx_now = cur.get("max_hp") or 0
+                        _dist2 = (max(abs(cur["x"] - _px2), abs(cur["y"] - _py2))
+                                  if _px2 is not None else 999)
+                        # 客户端读不到怪物血量(hp 和 max_hp 都是 0)时, "不掉血"判定没有依据:
+                        # 再等下去会在贴身满 AUTO_ATTACK_NOHP_SEC 秒后误判"打不到"而白换目标
+                        # (实测某客户端怪物 +0x112/+0x11A 恒为 0, 就是被这条坑的) -> 直接跳过,
+                        # 换目标交给不依赖血量的卡位检测(距离/原地不动)。
+                        if not (_hp_now or _mx_now):
+                            self._nohp_actor = 0
+                            self._nohp_hp = 0
+                            self._nohp_since = 0.0
+                        elif _dist2 <= AUTO_ATTACK_NEAR:
+                            if self._nohp_actor != self._cur_actor:
+                                self._nohp_actor = self._cur_actor
+                                self._nohp_hp = _hp_now
+                                self._nohp_since = time.time()
+                            elif _hp_now and self._nohp_hp and _hp_now < self._nohp_hp:
+                                self._nohp_hp = _hp_now
+                                self._nohp_since = time.time()
+                            elif (time.time() - self._nohp_since >= AUTO_ATTACK_NOHP_SEC
+                                  and time.time() >= self._cur_lock_until):
+                                _nm = cur.get("name", "?")
+                                _n = self._stuck_count.get(self._cur_actor, 0) + 1
+                                self._stuck_count[self._cur_actor] = _n
+                                if _n >= 2:
+                                    self._stuck_skip.add(self._cur_actor)
+                                    self._stuck_until[self._cur_actor] = time.time() + AUTO_ATTACK_BLACK_SEC
+                                    self.target_text = "{} 贴身{}秒不掉血→拉入卡位名单".format(_nm, int(AUTO_ATTACK_NOHP_SEC))
+                                else:
+                                    self.target_text = "{} 贴身{}秒不掉血→换目标".format(_nm, int(AUTO_ATTACK_NOHP_SEC))
+                                    app_log("[打怪] %s" % self.target_text)
+                                self._cur_actor = 0
+                                self._nohp_actor = 0
+                        else:
+                            self._nohp_actor = 0
+                    except Exception:
+                        pass
+
+                # (g) 打不死就换(可选): 同一个目标连续打超过 AUTO_ATTACK_MAX_SEC 秒还没死 -> 换目标
+                #     AUTO_ATTACK_MAX_SEC = 0 时这条完全关闭(默认)
+                _csa = getattr(self, "_cur_set_at", 0.0)
+                if (AUTO_ATTACK_MAX_SEC > 0 and self._cur_actor and _csa
+                        and time.time() - _csa >= AUTO_ATTACK_MAX_SEC
+                        and time.time() >= self._cur_lock_until):
+                    _nm3 = (cur or {}).get("name", "?")
+                    self.target_text = "{} 打{}秒没死→换目标".format(_nm3, int(AUTO_ATTACK_MAX_SEC))
+                    app_log("[打怪] %s" % self.target_text)
+                    self._cur_actor = 0
+                    self._best_actor = 0
+                    self._best_dist = None
+                    self._cur_set_at = time.time()
+                _notice = str(getattr(self, "target_text", "") or "")
+                if any(_kw in _notice for _kw in (
+                        "卡位第", "被挡住", "贴身", "不掉血", "没死→换目标")):
+                    self._combat_notice_text = _notice
+                    self._combat_notice_until = time.time() + 5.0
+            except Exception as exc:
+                self.target_text = "错误: {}".format(exc)
+            time.sleep(0.7)
+
+    def _update_npc_label(self):
+        try:
+            blk = getattr(self, "_npc_block", []) or []
+            self.npc_label.configure(text="已屏蔽：%d" % len(blk))
+        except Exception:
+            pass
+        self._refresh_manage_combo()
+
+    def _refresh_manage_combo(self):
+        """已屏蔽NPC 下拉: 列出当前屏蔽的名字, 供【移除】单个"""
+        try:
+            blk = list(getattr(self, "_npc_block", []) or [])
+            self._npc_items = [("npc", k, "NPC｜%s" % k) for k in blk]
+            nb = getattr(self, "npc_box", None)
+            if nb is not None:
+                labels = [it[2] for it in self._npc_items]
+                nb["values"] = labels
+                if nb.get() not in labels:
+                    nb.set("")
+        except Exception:
+            pass
+
+    def remove_npc_item(self):
+        """从 已屏蔽NPC 名单里删除下拉选中的那一个名字"""
+        try:
+            sel = (self.npc_box.get() or "").strip()
+            if not sel:
+                messagebox.showinfo("提示", "先在【已屏蔽NPC】下拉里选一个再点【移除】", parent=self.root)
+                return
+            key = None
+            for _k, kk, label in (getattr(self, "_npc_items", []) or []):
+                if label == sel:
+                    key = kk
+                    break
+            if key is None:
+                return
+            blk = list(getattr(self, "_npc_block", []) or [])
+            if key in blk:
+                blk.remove(key)
+            self._npc_block = blk
+            app_log("[NPC屏蔽] 已移除: %s" % key)
+            self.save_config()
+            self._update_npc_label()
+        except Exception as exc:
+            app_log("[NPC屏蔽] 移除失败: %s" % exc)
+
+    def add_npc_name(self, name=None):
+        """把一个名字加进 NPC 屏蔽表(立即生效 + 存进 config.json)"""
+        try:
+            if name is None:
+                name = self.npc_entry.get().strip()
+        except Exception:
+            name = (name or "").strip()
+        if not name:
+            return
+        if not hasattr(self, "_npc_block") or self._npc_block is None:
+            self._npc_block = []
+        if name not in self._npc_block:
+            self._npc_block.append(name)
+            app_log("[NPC屏蔽] 已加入: %s" % name)
+        try:
+            self.npc_entry.delete(0, "end")
+        except Exception:
+            pass
+        self._update_npc_label()
+        self.save_config()
+
+    def toggle_no_steal(self):
+        """不抢怪: 我们不碰它、它却掉血 -> 判定别人在打, 这么多秒内不选它当目标"""
+        global NO_STEAL
+        try:
+            NO_STEAL = bool(self.no_steal_var.get())
+        except Exception:
+            NO_STEAL = True
+        app_log("[攻击] 不抢怪(攻击的第2项) = %s (判定别人在打后 %.0f 秒内不选它; "
+                "要配合【攻击】勾选才起作用)"
+                % ("开" if NO_STEAL else "关", AUTO_ATTACK_OTHERS_SEC))
+        self.save_config()
+
+    def toggle_avoid_players(self):
+        """有人就闪: 屏幕里出现别的玩家 -> 放弃打怪去寻路, 屏幕里没人了再回来打"""
+        global AVOID_PLAYERS
+        try:
+            AVOID_PLAYERS = bool(self.avoid_players_var.get())
+        except Exception:
+            AVOID_PLAYERS = True
+        app_log("[攻击] 有人就闪(攻击的第3项) = %s (别人离开 %.0f 秒后恢复打怪; "
+                "要配合【攻击】勾选才起作用)"
+                % ("开" if AVOID_PLAYERS else "关", AVOID_PLAYER_CLEAR_SEC))
+        if not AVOID_PLAYERS:
+            self._avoid_players_active = False
+        self.save_config()
+
+
+    def block_selected_monster_name(self, name=None):
+        """把上面【怪物列表】里选中那行的名字加进 NPC 屏蔽表
+
+        只有"NPC 跑进了怪物列表"才需要拉黑(没进列表的不用管);
+        拉黑后这个名字立刻从列表消失, 也不再被打。
+        """
+        try:
+            if name is None:
+                sel = self.tree.selection()
+                if not sel:
+                    messagebox.showinfo("提示", "先在上面【怪物列表】里点一行再点拉黑", parent=self.root)
+                    return
+                vals = self.tree.item(sel[0], "values")
+                name = str(vals[1]).strip()
+            name = name.replace(" (卡位)", "").replace("(卡位)", "").strip()
+            if not name:
+                return
+            self.add_npc_name(name)
+        except Exception as exc:
+            app_log("[NPC屏蔽] 拉黑失败: %s" % exc)
+
+
+
+    @staticmethod
+    def _is_corpse(m):
+        """尸体: 当前血 0 且 最大值 > 0。
+
+        (两者都 0 = 客户端还没同步这只怪的血, 属于活怪 —— 老客户端选中才会同步)
+        """
+        try:
+            if MONSTER_DEAD_OFF:
+                return bool(int(m.get("dead") or 0))
+            return (m.get("hp") or 0) == 0 and (m.get("max_hp") or 0) > 0
+        except Exception:
+            return False
+
+    def _mon_name_ok(self, name):
+        """怪物名过滤: 不过滤 / 只打 / 不打（逻辑和拾取列表一样）"""
+        try:
+            mode = self.mon_filter_mode.get().strip()
+            raw = self.mon_filter.get("1.0", "end").strip()
+        except Exception:
+            return True
+        # NPC 屏蔽表永远优先生效(不管过滤模式) —— 下次启动也不会显示/攻击
+        try:
+            for k in (getattr(self, "_npc_block", None) or []):
+                if k and k in name:
+                    return False
+        except Exception:
+            pass
+        if mode == "不过滤" or not raw:
+            return True
+        kws = [k for k in re.split(r"[,，;；\s]+", raw) if k]
+        if not kws:
+            return True
+        hit = any(k in name for k in kws)
+        return hit if mode == "只打" else (not hit)
+
+    def _ui_has_monsters(self):
+        return bool(getattr(self, "_mon_last", []))
+
+    def _monster_list_for_ui(self):
+        """界面 和 自动寻路 共用的怪物列表: 原始列表 - 已打死 - 尸体 - 重复项。
+
+        1. 死掉的怪(尸体)仍留在客户端 ActorList 里:
+           不过滤就会出现"怪物列表显示 0 只, 寻路却一直说发现怪物、停在那里不走";
+        2. 客户端 ActorList 里同一只怪可能有多个槽(同一个对象地址,
+           或者同名同坐标的不同对象) -> 不去重界面会重复显示, 打怪循环还会重复挑它。
+        """
+        try:
+            mons = self.game.get_actors()
+        except Exception:
+            mons = []
+        try:
+            dead = getattr(self, "_dead", set())
+            mons = [m for m in mons if m.get("actor") not in dead]
+        except Exception:
+            pass
+
+        out = []
+        seen_ptr = set()
+        seen_xy = set()
+        for m in mons:
+            try:
+                if self._is_corpse(m):        # 尸体不进列表(否则会被当成可打目标)
+                    continue
+                if not self._mon_name_ok(m.get("name", "")):   # 只打/不打 过滤
+                    continue
+                actor = m.get("actor") or 0
+                if actor and actor in seen_ptr:
+                    continue
+                key = (m.get("name"), m.get("x"), m.get("y"))
+                if key in seen_xy:
+                    continue
+                if actor:
+                    seen_ptr.add(actor)
+                seen_xy.add(key)
+            except Exception:
+                pass
+            out.append(m)
+        return out
+
+    def _attackable_monsters(self):
+        """能打的怪 = 界面列表 - 已拉进卡位名单的。
+
+        自动寻路用它判断"要不要停下让位打怪"。
+        如果连这个都不排除, 那几个永远走不到跟前的怪会把寻路**永久**卡住;
+        只在界面列表里显示成灰色的"(卡位)"就够了。
+        """
+        try:
+            stuck = getattr(self, "_stuck_skip", set())
+            return [m for m in self._monster_list_for_ui()
+                    if m.get("actor") not in stuck]
+        except Exception:
+            return []
+
+    # ---------------- 自动捡物 ----------------
+    def _restore_pickup_after_limit(self):
+        if not self._pick_paused_by_weight:
+            return False
+        self._pick_paused_by_weight = False
+        self._pick_pause_reason = ""
+        if (getattr(self, "guaji", False)
+                and self.pickup_enable.get()
+                and not getattr(self, "auto_pickup", False)):
+            self.toggle_auto_pickup(from_weight=True)
+            return True
+        return False
+
+    def toggle_auto_pickup(self, from_weight=False):
+        self.auto_pickup = not getattr(self, "auto_pickup", False)
+        if self.auto_pickup:
+            self._pick_paused_by_weight = False
+            self._pick_pause_reason = ""
+            self._pick_fail = {}
+            self._pick_wait_obj = 0
+            self._pick_wait_from = 0.0
+            self._pick_route_target = 0
+            self._pick_try_obj = 0
+            self._loot_pending = False
+            self.pick_btn.configure(text="停止捡物")
+            self.pick_state.configure(text="运行中", foreground="#009900")
+            if self.pick_thread is None or not self.pick_thread.is_alive():
+                self.pick_thread = threading.Thread(target=self.pickup_loop, daemon=True)
+                self.pick_thread.start()
+        else:
+            if not from_weight:
+                self._pick_paused_by_weight = False
+                self._pick_pause_reason = ""
+            self._loot_pending = False
+            self._move_release("pick")
+            self.pick_btn.configure(text="自动捡物")
+            self.pick_state.configure(text="已停止", foreground="#888888")
+
+    def _pick_name_ok(self, name):
+        """按名称过滤: 返回 True 表示这件可以捡。
+
+        不过滤 / 关键词为空 -> 全放行;
+        只捡 -> 名称包含任一关键词才捡;
+        不捡 -> 名称包含任一关键词就跳过。
+        """
+        try:
+            mode = self.pick_filter_mode.get().strip()
+            raw = self.pick_filter.get("1.0", "end").strip()
+        except Exception:
+            return True
+        if mode == "不过滤" or not raw:
+            return True
+        kws = [k for k in re.split(r"[,，;；\s]+", raw) if k]
+        if not kws:
+            return True
+        hit = any(k in name for k in kws)
+        return hit if mode == "只捡" else (not hit)
+
+    # ---------------- 移动调度器(PATROL/PICKUP/ATTACK/IDLE) ----------------
+    def _move_busy(self, prio):
+        with self._move_lock:
+            state = getattr(self, "_move_state", MOVE_STATE_IDLE)
+            if state == MOVE_STATE_ATTACK:
+                return True
+            if state == MOVE_STATE_PICKUP and prio < MOVE_PRIO_PICK:
+                return True
+            if (time.time() < getattr(self, "_move_until", 0.0)
+                    and getattr(self, "_move_prio", 0) > prio):
+                return True
+        if getattr(self, "_avoid_players_active", False) and prio == MOVE_PRIO_PICK:
+            return True
+        if (getattr(self, "auto_attack", False)
+                and getattr(self, "_cur_actor", 0)):
+            return True
+        return False
+
+    def _move_claim(self, owner, prio, x, y, hold=None):
+        state_new = MOVE_STATE_PATROL if owner == "route" else MOVE_STATE_PICKUP
+        if self._move_busy(prio):
+            return False
+        target = (int(x), int(y))
+        need_stop = False
+        with self._move_lock:
+            state = getattr(self, "_move_state", MOVE_STATE_IDLE)
+            if state == MOVE_STATE_ATTACK:
+                return False
+            if state == MOVE_STATE_PICKUP and state_new != MOVE_STATE_PICKUP:
+                return False
+            if (state_new == MOVE_STATE_PATROL and state == MOVE_STATE_PATROL
+                    and self._move_target != target and self.game.is_moving()):
+                return False
+            if state_new == MOVE_STATE_PICKUP:
+                if (state == MOVE_STATE_PICKUP and self._move_target == target
+                        and self._move_sent and self.game.is_moving()):
+                    return True
+                need_stop = state in (MOVE_STATE_PATROL, MOVE_STATE_PICKUP)
+            self._move_state = state_new
+            self._move_owner = owner
+            self._move_prio = prio
+            self._move_until = time.time() + (hold if hold else MOVE_CLAIM_HOLD_SEC)
+            self._move_target = target
+            self._move_sent = False
+            if need_stop:
+                try:
+                    self.game.stop_move()
+                except Exception:
+                    return False
+            try:
+                ok = bool(self.game.move_to(target[0], target[1]))
+            except Exception:
+                ok = False
+            if ok:
+                self._move_sent = True
+            return ok
+
+    def _move_begin_attack(self):
+        with self._move_lock:
+            old = getattr(self, "_move_state", MOVE_STATE_IDLE)
+            if old == MOVE_STATE_ATTACK:
+                return
+            self._move_state = MOVE_STATE_ATTACK
+            self._move_owner = "attack"
+            self._move_prio = MOVE_PRIO_ATTACK
+            self._move_until = time.time() + MOVE_CLAIM_HOLD_SEC
+            self._move_target = None
+            self._move_sent = False
+        if old in (MOVE_STATE_PATROL, MOVE_STATE_PICKUP):
+            try:
+                self.game.stop_move()
+            except Exception:
+                pass
+
+    def _move_finish_attack(self):
+        with self._move_lock:
+            if getattr(self, "_move_state", MOVE_STATE_IDLE) != MOVE_STATE_ATTACK:
+                return
+            try:
+                self.game.clear_attack_target()
+            except Exception:
+                pass
+            try:
+                self.game.stop_move()
+            except Exception:
+                pass
+            self._move_state = MOVE_STATE_IDLE
+            self._move_owner = ""
+            self._move_prio = 0
+            self._move_until = 0.0
+            self._move_target = None
+            self._move_sent = False
+
+    def _move_finish_pickup(self):
+        with self._move_lock:
+            if getattr(self, "_move_state", MOVE_STATE_IDLE) != MOVE_STATE_PICKUP:
+                return
+            try:
+                self.game.stop_move()
+            except Exception:
+                pass
+            self._move_state = MOVE_STATE_IDLE
+            self._move_owner = ""
+            self._move_prio = 0
+            self._move_until = 0.0
+            self._move_target = None
+            self._move_sent = False
+
+    def _move_release(self, owner=None):
+        with self._move_lock:
+            if owner and getattr(self, "_move_owner", "") not in ("", owner):
+                return False
+            old = getattr(self, "_move_state", MOVE_STATE_IDLE)
+            if old != MOVE_STATE_IDLE:
+                try:
+                    self.game.stop_move()
+                except Exception:
+                    pass
+            self._move_state = MOVE_STATE_IDLE
+            self._move_owner = ""
+            self._move_prio = 0
+            self._move_until = 0.0
+            self._move_target = None
+            self._move_sent = False
+        return True
+
+    def pickup_loop(self):
+        """自动捡物: 通过统一移动调度器走到物品格, 不发鼠标点击。"""
+        while getattr(self, "auto_pickup", False):
+            try:
+                try:
+                    rng = max(1, int(self.pick_range.get().strip() or "8"))
+                except Exception:
+                    rng = 8
+                now = time.time()
+                if (not getattr(self, "_cur_actor", 0)
+                        and getattr(self, "_move_state", "") == MOVE_STATE_ATTACK):
+                    self._move_finish_attack()
+
+                # 捡不起来的物品, 过一会儿放出来再试
+                for _o in [_o for _o, _t in list(self._pick_fail.items())
+                           if now - _t > PICK_FAIL_COOLDOWN]:
+                    self._pick_fail.pop(_o, None)
+
+                # 打怪中不抢移动权(自动攻击要带人物走向怪物)
+                if (getattr(self, "auto_attack", False)
+                        and getattr(self, "_cur_actor", 0)):
+                    # ★ 打怪期间"去不了"不算数: 把"去这件东西"的计时清掉。
+                    #   否则打怪中途它在计时, 打完怪一回来就看到"已超过 PICK_REACH_SEC(8秒)"
+                    #   -> 明明是走得到的掉落物, 直接被拉进捡物黑名单(要等 PICK_FAIL_COOLDOWN=20 秒)
+                    self._pick_try_obj = 0
+                    self._pick_wait_obj = 0
+                    self.pick_state.configure(text="打怪中", foreground="#CC6600")
+                    time.sleep(0.6)
+                    continue
+
+                items = self.game.get_items(force=True)
+                cands = [it for it in items
+                         if it[0] <= rng
+                         and it[4] not in self._pick_fail
+                         and self._pick_name_ok(it[1])]
+                if not cands:
+                    # 刚打死怪: 掉落物要等客户端生成(半秒~1.5秒), 这期间"无物品"不算数,
+                    # 否则 _loot_pending 立刻被清 -> 打怪马上打下一只 -> 东西永远捡不到
+                    # 慢机器上"一拍"可能好几秒: 用"真的看了地上几次"来判定, 而不是把秒数放大
+                    # (放大秒数会让慢机器上打怪/捡物间隔越来越长, 显得很呆)
+                    # 规则: 还没看够 LOOT_APPEAR_SCANS 次, 且没到 LOOT_APPEAR_SEC 硬上限 -> 继续等
+                    if getattr(self, "_loot_pending", False):
+                        self._loot_scans = getattr(self, "_loot_scans", 0) + 1
+                    if (getattr(self, "_loot_pending", False)
+                            and getattr(self, "_loot_scans", 0) < LOOT_APPEAR_SCANS
+                            and (now - getattr(self, "_loot_from", 0.0)) < LOOT_APPEAR_SEC):
+                        self.pick_state.configure(text="等掉落…", foreground="#CC6600")
+                        time.sleep(0.4)
+                        continue
+                    if RHYTHM_TRACE and getattr(self, "_loot_pending", False):
+                        _r = getattr(self, "_rhythm", None)
+                        if _r and _r.get("kill") and not _r.get("loot_end"):
+                            _r["loot_end"] = time.time()
+                            app_log("[节奏] 捡物结束: 地上没可捡的了 (距打死 %.1f 秒)"
+                                    % (_r["loot_end"] - _r["kill"]))
+                    self._pick_wait_obj = 0
+                    self._pick_route_target = 0
+                    self._pick_try_obj = 0
+                    self._loot_pending = False
+                    self._move_finish_pickup()
+                    if self._pick_fail:
+                        self.pick_state.configure(
+                            text="跳过 %d 件" % len(self._pick_fail),
+                            foreground="#CC6600")
+                    else:
+                        self.pick_state.configure(text="无物品", foreground="#888888")
+                    time.sleep(0.8)
+                    continue
+
+                cands.sort()
+                d, nm, x, y, obj = cands[0]
+                if RHYTHM_TRACE:
+                    _r = getattr(self, "_rhythm", None)
+                    if _r and _r.get("kill") and not _r.get("loot_start"):
+                        _r["loot_start"] = time.time()
+                        app_log("[节奏] 捡物开始: 地上 %d 件可捡, 最近的是 %s 距离%d (距打死 %.1f 秒)"
+                                % (len(cands), nm, d, _r["loot_start"] - _r["kill"]))
+                px, py = self.game.get_player_pos()
+                if px == x and py == y:
+                    # 已经站到物品格 -> 等客户端捡起来
+                    self._pick_try_obj = 0
+                    if self._pick_wait_obj != obj:
+                        self._pick_wait_obj = obj
+                        self._pick_wait_from = now
+                    waited = now - self._pick_wait_from
+                    if waited >= PICK_WAIT_SEC:
+                        self._pick_fail[obj] = now
+                        self._pick_wait_obj = 0
+                        self._pick_route_target = 0
+                        self.pick_state.configure(
+                            text="捡不起，跳过 %s" % nm, foreground="#CC6600")
+                    else:
+                        self.pick_state.configure(
+                            text="等捡 %s %.0fs" % (nm, waited),
+                            foreground="#009900")
+                else:
+                    self._pick_wait_obj = 0
+                    # 跟踪"去这件东西"花了多久: 一直原地不动就认为走不到, 跳过
+                    if self._pick_try_obj != obj:
+                        self._pick_try_obj = obj
+                        self._pick_try_since = now
+                        self._pick_try_pos = (px, py)
+                    elif (px, py) != self._pick_try_pos:
+                        self._pick_try_pos = (px, py)
+                        self._pick_try_since = now
+                    elif (now - self._pick_try_since) >= PICK_REACH_SEC:
+                        self._pick_fail[obj] = now
+                        self._pick_try_obj = 0
+                        self._pick_route_target = 0
+                        self.pick_state.configure(
+                            text="到不了，跳过 %s" % nm, foreground="#CC6600")
+                        time.sleep(0.2)
+                        continue
+                    if self._pick_route_target != obj or not self.game.is_moving():
+                        if self._move_claim("pick", MOVE_PRIO_PICK, x, y):
+                            self._pick_route_target = obj
+                        else:
+                            # 移动权被拒(打怪余温 / 寻路刚发过 / 有人就闪) -> 这不是"到不了",
+                            # 重新计时, 别把走得到的掉落物拉进黑名单
+                            self._pick_try_since = now
+                            self._pick_try_pos = (px, py)
+                    self.pick_state.configure(
+                        text="去捡 %s (%d,%d)" % (nm, x, y),
+                        foreground="#0066CC")
+            except Exception as _e:
+                try:
+                    self.pick_state.configure(text="捡物错误: %s" % _e, foreground="#CC0000")
+                except Exception:
+                    pass
+            time.sleep(0.7)
+
+    def refresh(self):
+        # 拖窗口的时候跳过重活: 否则每 500ms 重建表格 + 读内存, 拖起来一卡一卡
+        try:
+            if self.root.state() == "iconic":
+                self.root.after(500, self.refresh)
+                return
+            _pos = (self.root.winfo_x(), self.root.winfo_y())
+            if getattr(self, "_win_pos", None) != _pos:
+                self._win_pos = _pos
+                self.root.after(500, self.refresh)
+                return
+        except Exception:
+            pass
+        _t_refresh = time.time()
+        # 未开始挂机 -> 不扫描游戏内存, 只显示静态状态
+        # (背包负重也改成: 点了"开始挂机"之后才检测)
+        if not getattr(self, "guaji", False):
+            try:
+                if hasattr(self, "count_label"):
+                    self.count_label.configure(text="怪物数量：--（未开始挂机）")
+                if hasattr(self, "pet_info"):
+                    self.pet_info.configure(text="--")
+                if hasattr(self, "hp_label"):
+                    self.hp_label.configure(text="血量 --/--")
+                self._refresh_unified_state()
+            except Exception:
+                pass
+            self.root.after(500, self.refresh)
+            return
+        try:
+            # 列表已经在 _monster_list_for_ui() 里滤掉: 已打死 / 尸体 / 重复项
+            # (客户端怪物血量只在选中时才同步, 所以"hp=0 且 max>0"才算尸体)
+            monsters = self._monster_list_for_ui()
+            if getattr(self.game, "_actor_lookup_failed", False):
+                # 这一轮没反查到 Actor 数组(数组被游戏重分配等) -> 保留上次列表, 不要显示 0
+                monsters = list(getattr(self, "_mon_last", []))
+            else:
+                self._mon_last = list(monsters)
+            _dead = getattr(self, "_dead", set())
+            _stuck = getattr(self, "_stuck_skip", set())
+            px, py = self.game.get_player_pos()
+            self.player_x, self.player_y = px, py
+            if hasattr(self, "skill_count_label"):
+                try:
+                    radius = max(0, int(self.skill_range.get().strip() or "2"))
+                    near_count = self._count_nearby_monsters(monsters, px, py, radius)
+                    self.skill_count_label.configure(
+                        text="范围 %d只" % near_count)
+                except Exception:
+                    pass
+            monsters.sort(key=lambda m: max(abs(m["x"] - px), abs(m["y"] - py)))
+
+            if COUNT_ALIVE_ONLY:
+                # 新客户端: 尸体不算数量(hp==0 且 max_hp>0 = 尸体; 两者都 0 = 还没同步血量)
+                _corpse_n = sum(1 for m in monsters if self._is_corpse(m))
+                _txt = f"怪物数量：{len(monsters) - _corpse_n}"
+                if _corpse_n:
+                    _txt += f"（尸体{_corpse_n}）"
+                self.count_label.configure(text=_txt)
+            else:
+                # 老客户端: 保持原样
+                self.count_label.configure(text=f"怪物数量：{len(monsters)}")
+            self._refresh_unified_state()
+
+            _msig = tuple((m.get("actor"), m.get("name"), m.get("x"), m.get("y"),
+                           m.get("hp"), m.get("max_hp"), m.get("dead"), m.get("actor") in _stuck)
+                          for m in monsters)
+            if _msig != getattr(self, "_mon_sig", ""):
+                self._mon_sig = _msig
+
+                for item in self.tree.get_children():
+                    self.tree.delete(item)
+
+                _bad = 0
+                for i, m in enumerate(monsters, 1):
+                    try:
+                        dist = max(abs(m["x"] - px), abs(m["y"] - py))   # "格"=切比雪夫, 与入列过滤一致
+                        if (m["hp"] or 0) == 0 and (m["max_hp"] or 0) == 0:
+                            hp_text = "?"          # 未选中, 客户端还没同步血量
+                        elif (m["hp"] or 0) == 0:
+                            hp_text = "?/" + str(m["max_hp"])
+                        else:
+                            hp_text = f'{m["hp"]} / {m["max_hp"]}'
+                        _nm = m["name"]
+                        _tags = ()
+                        if m["actor"] in _stuck:
+                            _nm = _nm + " (卡位)"
+                            _tags = ("stuck",)
+                        self.tree.insert(
+                            "",
+                            "end",
+                            values=(i, _nm, m["x"], m["y"], hp_text, dist),
+                            tags=_tags,
+                        )
+                    except Exception as _e2:
+                        _bad += 1
+                        if _bad <= 3:
+                            _say("[怪物行插入失败] %r %r" % (m, _e2))
+            if hasattr(self, "item_tree"):
+                _pfail = getattr(self, "_pick_fail", {})
+                if getattr(self, "auto_pickup", False):
+                    try:
+                        _item_rows = self.game.get_items(px, py)
+                    except Exception:
+                        _item_rows = []
+                else:
+                    _item_rows = []
+                _isig = tuple((r[4], r[1], r[2], r[3], r[4] in _pfail)
+                              for r in _item_rows)
+                if _isig != getattr(self, "_item_sig", ""):
+                    self._item_sig = _isig
+
+                    for it in self.item_tree.get_children():
+                        self.item_tree.delete(it)
+                    for i, row in enumerate(_item_rows, 1):
+                        d, inm, ix, iy, iaddr = row
+                        _tags = ()
+                        _nm = inm
+                        if iaddr in _pfail:
+                            _nm = inm + "  (跳过)"
+                            _tags = ("skip",)
+                        self.item_tree.insert("", "end", tags=_tags, values=(
+                            i, _nm, ix, iy, d, "0x%08X" % iaddr))
+            # 刷新背包
+            if hasattr(self, "bag_tree"):
+                try:
+                    bag = self.game.get_bag()
+                    _bsig = tuple((b["slot"], b["name"], b["used"], b["category_id"]) for b in bag)
+                except Exception:
+                    bag, _bsig = [], None
+                if bag and _bsig != getattr(self, "_bag_sig", ""):
+                    self._bag_sig = _bsig
+
+                    try:
+                        used = sum(1 for b in bag if b["used"])
+                        self.bag_label.configure(
+                            text="背包 占用 %d/%d" % (used, len(bag)))
+                        for it in self.bag_tree.get_children():
+                            self.bag_tree.delete(it)
+                        for b in bag:
+                            if b["used"]:
+                                self.bag_tree.insert("", "end",
+                                                     values=(b["slot"], b["name"],
+                                                             b["category_id"]))
+                            else:
+                                self.bag_tree.insert("", "end",
+                                                     values=(b["slot"], "-", ""),
+                                                     tags=("empty",))
+                    except Exception:
+                        pass
+
+            # 刷新 背包负重 + 背包占用 + 触发处理
+            if hasattr(self, "w_label"):
+                try:
+                    w, wm = self.game.get_weight()
+                    wpct = 0.0
+                    if wm:
+                        wpct = w * 100.0 / wm
+                        self.w_label.configure(text="负重 %d/%d" % (w, wm))
+                        self.w_bar.configure(maximum=wm, value=w)
+                    else:
+                        self.w_label.configure(text="负重 --/--")
+                        self.w_bar.configure(value=0)
+
+                    # 显示永远读真实占用(下面"背包"勾选项只决定"到阈值要不要动作")
+                    bag_used, bag_max = 0, BAG_SLOT_COUNT
+                    try:
+                        bag = self.game.get_bag()
+                        bag_used = sum(1 for b in bag if b["used"])
+                        bag_max = len(bag) or BAG_SLOT_COUNT
+                    except Exception:
+                        pass
+                    if hasattr(self, "w_bag_label"):
+                        bpct = (bag_used * 100.0 / bag_max) if bag_max else 0.0
+                        self.w_bag_label.configure(text="背包 %d/%d" % (bag_used, bag_max))
+                        if hasattr(self, "bag_bar"):
+                            self.bag_bar.configure(maximum=bag_max or 100, value=bag_used)
+
+                    if not self.w_enable.get():
+                        self._restore_pickup_after_limit()
+                        self.w_state.configure(text="未启用", foreground="#888888")
+                    else:
+                        bag_over = False
+                        weight_over = False
+                        if self.w_bag_on.get():
+                            try:
+                                bth = int(float(self.w_bag_thresh.get().strip() or "39"))
+                            except Exception:
+                                bth = 39
+                            if bag_used >= bth:
+                                bag_over = True
+                        if self.w_wt_on.get() and wm:
+                            try:
+                                wth = float(self.w_thresh.get().strip() or "98")
+                            except Exception:
+                                wth = 98.0
+                            if wpct >= wth:
+                                weight_over = True
+                        over = bag_over or weight_over
+                        if over:
+                            if self.w_action.get() == "stop":
+                                if bag_over:
+                                    self._pick_pause_reason = "包满暂停"
+                                elif weight_over:
+                                    self._pick_pause_reason = "负重暂停"
+                                if getattr(self, "auto_pickup", False):
+                                    self._pick_paused_by_weight = True
+                                    self.toggle_auto_pickup(from_weight=True)
+                                self.w_state.configure(
+                                    text=self._pick_pause_reason or "暂停捡物",
+                                    foreground="#CC0000")
+                            else:
+                                self._restore_pickup_after_limit()
+                                key = self.w_key.get().strip().upper()
+                                vk = self.VK_MAP.get(key)
+                                if vk and (time.time() - getattr(self, "_w_last", 0.0)) >= 1.0:
+                                    self.game.press_key(vk, tag="负重")
+                                    self._w_last = time.time()
+                                    self.w_state.configure(
+                                        text="已按 %s" % key, foreground="#CC6600")
+                                else:
+                                    self.w_state.configure(
+                                        text="等待按键", foreground="#CC6600")
+                        else:
+                            self._restore_pickup_after_limit()
+                            self.w_state.configure(text="正常", foreground="#009900")
+                except Exception:
+                    pass
+            # 刷新人物血量显示
+            if hasattr(self, "hp_label"):
+                try:
+                    hp, mx = self.game.get_player_hp()
+                    if mx:
+                        pct = hp * 100.0 / mx
+                        self.hp_label.configure(text="血量 %d/%d" % (hp, mx))
+                        self.hp_bar.configure(maximum=mx, value=hp)
+                    else:
+                        self.hp_label.configure(text="血量 --/--")
+                        self.hp_bar.configure(value=0)
+                except Exception:
+                    pass
+
+            self._fail_count = 0
+            if hasattr(self, "status_label"):
+                self.status_label.configure(text=self.status_text())
+            _ms = (time.time() - _t_refresh) * 1000.0
+            if _ms > 250:
+                try:
+                    app_log("[刷新] 本次耗时 %.0f ms (怪 %d)" % (_ms, len(monsters)))
+                except Exception:
+                    pass
+        except Exception as _exc:
+            import traceback
+            tb = traceback.format_exc()
+            try:
+                _say("[refresh 出错] %s" % _exc)
+                _say(tb)
+            except Exception:
+                pass
+            self._fail_count = getattr(self, "_fail_count", 0) + 1
+            if hasattr(self, "status_label"):
+                self.status_label.configure(
+                    text="读取出错(%d): %s" % (self._fail_count, _exc))
+            # 游戏崩了 / 重开后 PID 变了 -> 手里那个句柄就废了, 每次读都是 299。
+            # 连续几次读内存失败就自动重新绑定(重新扫进程 + 校验模块大小), 不然一直刷错误。
+            _msg = str(_exc)
+            _dead = any(k in _msg for k in (
+                "Could not read memory", "299", "Could not open process",
+                "invalid handle", "句柄无效"))
+            if (_dead and self._fail_count >= 3
+                    and (time.time() - getattr(self, "_last_rebind", 0.0)) >= 10.0):
+                self._last_rebind = time.time()
+                try:
+                    self.game.detach()
+                except Exception:
+                    pass
+                try:
+                    self.game.attach()
+                    self._fail_count = 0
+                    app_log("[连接] 游戏重开后已自动重新绑定: pid=%s"
+                            % getattr(self.game, "pid", "?"))
+                except Exception as _e2:
+                    app_log("[连接] 自动重新绑定失败: %s" % _e2)
+
+        self.root.after(500, self.refresh)
+
+    def on_close(self):
+        self.auto_attack = False
+        self.auto_hp = False
+        self.auto_skill = False
+        self.auto_pet = False
+        self.auto_pickup = False
+        try:
+            self.save_config()
+        except Exception:
+            pass
+        try:
+            self.game.clear_attack_target()
+        except Exception:
+            pass
+        try:
+            self.game.stop_move()
+        except Exception:
+            pass
+        try:
+            self.game.close_move_timer()
+        except Exception:
+            pass
+        try:
+            self.game.dm_input.close()
+        except Exception:
+            pass
+        self.root.destroy()
+def load_client_profiles(path=None):
+    """读 clients.json; 读不到就返回 {} (继续用代码里的默认值)
+
+    优先用 exe 旁边那份(用户能自己改), 没有就用打包进 exe 的默认那份。
+    """
+    if path is None:
+        path = CLIENTS_FILE if os.path.exists(CLIENTS_FILE) else CLIENTS_DEFAULT
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    profs = data.get("profiles")
+    return profs if isinstance(profs, dict) else {}
+def _client_value(v):
+    """"0x1234" 这种字符串转成 int; 数组逐项转; 其它原样"""
+    if isinstance(v, list):
+        return [_client_value(x) for x in v]
+    if isinstance(v, str):
+        t = v.strip()
+        if t.lower().startswith("0x"):
+            try:
+                return int(t, 16)
+            except Exception:
+                return v
+        if t.lstrip("-").isdigit():
+            return int(t)
+    return v
+def _snapshot_client_defaults():
+    """第一次套用配置前把"内置默认值"记下来(之后换客户端先还原, 防止上个客户端的键残留)"""
+    if _CLIENT_DEFAULTS:
+        return
+    g = globals()
+    for k in CLIENT_MODULE_KEYS:
+        if k in g:
+            _CLIENT_DEFAULTS[k] = g[k]
+    cls = g.get("GameMemory")
+    if cls is not None:
+        for k in CLIENT_CLASS_KEYS:
+            if hasattr(cls, k):
+                _CLIENT_DEFAULTS[("cls", k)] = getattr(cls, k)
+def apply_client_profile(prof, game_cls=None):
+    """把一套客户端配置写到模块全局 + GameMemory 类属性上
+
+    注意: 每次套用都先把"内置默认值"还原一遍 —— 否则新客户端定义的键(比如攻击槽两条链)
+    会残留在模块全局上, 切回老客户端时会用错偏移。
+    """
+    if not prof:
+        return False
+    g = globals()
+    _snapshot_client_defaults()
+    for k in CLIENT_MODULE_KEYS:
+        if k in _CLIENT_DEFAULTS:
+            g[k] = _CLIENT_DEFAULTS[k]
+        if k in prof:
+            v = _client_value(prof[k])
+            if isinstance(v, list):
+                if k in CLIENT_SET_KEYS:
+                    v = set(v)
+                elif k in CLIENT_TUPLE_KEYS:
+                    v = tuple(v)
+            g[k] = v
+    if game_cls is None:
+        game_cls = g.get("GameMemory")
+    if game_cls is not None:
+        for k in CLIENT_CLASS_KEYS:
+            key = ("cls", k)
+            if key in _CLIENT_DEFAULTS:
+                setattr(game_cls, k, _CLIENT_DEFAULTS[key])
+            if k in prof:
+                setattr(game_cls, k, _client_value(prof[k]))
+    return True
+def _profile_int(prof, key, default=0):
+    try:
+        return int(_client_value(prof.get(key, default)))
+    except Exception:
+        return default
+def _detect_profile_by_memory(profiles, processes, preferred=""):
+    order = []
+    if preferred in profiles:
+        order.append(preferred)
+    order.extend(cid for cid in profiles if cid != preferred)
+
+    skip = {
+        "system", "secure system", "registry", "smss.exe", "csrss.exe", "wininit.exe",
+        "services.exe", "lsass.exe", "svchost.exe", "fontdrvhost.exe", "dwm.exe",
+        "explorer.exe", "cmd.exe", "powershell.exe", "pwsh.exe", "conhost.exe",
+        "python.exe", "pythonw.exe", "pycharm64.exe", "codex.exe", "chatgpt.exe",
+        "notepad.exe", "taskmgr.exe", "searchapp.exe",
+    }
+
+    for proc in processes:
+        name = getattr(proc, "name", None) or getattr(proc, "szExeFile", "")
+        if isinstance(name, bytes):
+            name = name.decode("mbcs", "ignore")
+        pid = getattr(proc, "pid", None) or getattr(proc, "th32ProcessID", None)
+        if not name or not pid or pid == os.getpid():
+            continue
+        low = str(name).lower()
+        if low in skip or "cheatengine" in low:
+            continue
+
+        pm = None
+        try:
+            pm = pymem.Pymem(pid)
+            module = pymem.process.module_from_name(pm.process_handle, name)
+            if not module or module.SizeOfImage < 5_000_000:
+                continue
+            module_size = int(module.SizeOfImage)
+            candidates = []
+            for cid in order:
+                prof = profiles.get(cid) or {}
+                expected = _profile_int(prof, "MODULE_SIZE", 0)
+                if expected and abs(module_size - expected) <= 0x10000:
+                    candidates.append((cid, prof))
+            if not candidates:
+                continue
+
+            base = int(module.lpBaseOfDll)
+            for cid, prof in candidates:
+                scene_off = _profile_int(prof, "OFF_PLAY_SCENE", 0)
+                player_off = _profile_int(prof, "OFF_PLAYER", 0)
+                if not scene_off and not player_off:
+                    continue
+                if player_off:
+                    player = pm.read_uint(base + player_off)
+                    if not (0x10000 <= player < 0x80000000):
+                        continue
+                    vmt = pm.read_uint(player)
+                    if not (base <= vmt < base + module_size):
+                        continue
+                if scene_off:
+                    scene = pm.read_uint(base + scene_off)
+                    if not (0x10000 <= scene < 0x80000000):
+                        continue
+                return cid
+        except Exception:
+            pass
+        finally:
+            if pm is not None:
+                try:
+                    pm.close_process()
+                except Exception:
+                    pass
+    return ""
+def pick_startup_profile(profiles):
+    """挑一套配置: 优先"现在真的在运行"的客户端, 其次 config.json 里记的, 最后第一个
+
+    注意: 不能一上来就用 config.json 里的 client —— 换客户端后里面还记着老客户端,
+    会一直绑到没在运行的那个(报"没有找到游戏进程")。
+    """
+    if not profiles:
+        return None
+    want = ""
+    try:
+        _cf = CONFIG_FILE if os.path.exists(CONFIG_FILE) else CONFIG_DEFAULT
+        with open(_cf, "r", encoding="utf-8") as f:
+            want = str(json.load(f).get("client") or "")
+    except Exception:
+        pass
+
+    processes = []
+    running = set()
+    try:
+        processes = list(pymem.process.list_processes())
+        for proc in processes:
+            n = getattr(proc, "szExeFile", None) or getattr(proc, "name", None)
+            if isinstance(n, bytes):
+                n = n.decode("mbcs", "ignore")
+            if n:
+                running.add(n.lower())
+    except Exception:
+        pass
+
+    def _is_running(cid):
+        try:
+            return str(profiles[cid].get("PROCESS_NAME", "")).lower() in running
+        except Exception:
+            return False
+
+    # 1) 上次用的那个客户端现在就开着 -> 继续用它
+    if want in profiles and _is_running(want):
+        return want
+    # 2) 否则挑一个"正在运行"的客户端(两个都开着时按 clients.json 里的顺序)
+    for cid in profiles:
+        if _is_running(cid):
+            return cid
+    # 3) 随机名客户端: 按 SizeOfImage + 场景/人物内存特征匹配
+    detected = _detect_profile_by_memory(profiles, processes, want)
+    if detected:
+        _say("[客户端] 内存特征匹配: %s" % detected)
+        return detected
+    # 4) 谁都没开: 用上次记的, 再退到第一个
+    if want in profiles:
+        return want
+    return next(iter(profiles))
+def set_active_client(cid):
+    global ACTIVE_CLIENT
+    ACTIVE_CLIENT = cid or ""
+def main():
+    if not lic_ensure():        # \u672a\u6388\u6743(\u673a\u5668\u7801\u4e0d\u5bf9) -> \u76f4\u63a5\u9000\u51fa
+        return
+    root = tk.Tk(className=("RuntimeHost" if STEALTH_MODE else "Tk"))
+    root.withdraw()
+
+    # ---- 选客户端配置(clients.json) ----
+    profs = load_client_profiles()
+    cid = pick_startup_profile(profs)
+    if cid:
+        set_active_client(cid)
+        apply_client_profile(profs[cid])
+        _say("[客户端] 使用配置: %s (%s)" % (cid, profs[cid].get("PROCESS_NAME", "?")))
+
+    # 启动【不绑定】: 界面直接出来, 显示"未绑定"
+    # 绑定方式: 把工具栏那个准星图标拖到游戏窗口上松手
+    game = GameMemory(autobind=False)
+    _say("[绑定] 未绑定 —— 拖拽准星到游戏窗口")
+
+    app = CheatApp(root, game)
+    if not STEALTH_MODE:
+        root.deiconify()
+    # 不自动绑定: 界面起来后用【拖拽绑定】图标拖到游戏窗口上
+    root.mainloop()
+if __name__ == "__main__":
+    main()
